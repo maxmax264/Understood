@@ -326,7 +326,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     }
 
     const metaRef = admin.database()
-        .ref(`organizations/${orgId}/metadata/settings`);
+        .ref(`organizations/${orgId}/metadata`);
     const metaSnapshot = await metaRef.once("value");
     const meta = metaSnapshot.val() || {};
     const mosadId = meta.nedarim_mosad_id ?
