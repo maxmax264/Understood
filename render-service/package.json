@@ -1,0 +1,16 @@
+{
+  "name": "sionyx-payment-bridge",
+  "version": "1.0.0",
+  "description": "Nedarim Plus webhook + saved-card charge bridge for SIONYX, deployed on Render instead of Firebase Cloud Functions (no Blaze plan required).",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "firebase-admin": "^12.1.0"
+  }
+}
