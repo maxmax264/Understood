@@ -533,6 +533,130 @@ function tryDecrypt(value) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// POST /confirmPayment - client-attested fallback for the regular
+// (non-saved-card) iframe flow.
+//
+// Why this exists: the iframe already tells the WPF client directly,
+// via postMessage, that Nedarim returned Status=OK - that part always
+// worked. The *separate* server-to-server webhook (nedarimCallback,
+// via the CallBack= param sent to Nedarim) is what's supposed to credit
+// the user - but if Nedarim never actually calls it (e.g. the callback
+// URL isn't enabled/whitelisted yet on this Mosad's account), the
+// purchase is stuck "pending" forever even though the card was charged.
+//
+// This endpoint lets the already-authenticated client say "the iframe
+// told me this purchase succeeded, here's the transaction info" and the
+// server credits the SAME way nedarimCallback would have - looking up
+// amount/minutes/printBudget from the purchase record itself (never
+// trusting client-supplied amounts), same idempotency check, same
+// atomic update. It is NOT a substitute for fixing the real webhook
+// with Nedarim - it's a stopgap so kiosks aren't stuck while that gets
+// sorted out. Once nedarimCallback reliably fires, this becomes a
+// redundant safety net rather than the only path (idempotency check
+// below means whichever arrives first wins; the second is a no-op).
+// ═══════════════════════════════════════════════════════════════════
+app.post("/confirmPayment", async (req, res) => {
+  const correlationId = generateCorrelationId();
+  const log = createLogger({correlationId, service: "confirm-payment"});
+
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ?
+      authHeader.slice(7) : null;
+    if (!idToken) {
+      return callableError(res, 401, "unauthenticated", "Must be authenticated");
+    }
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(idToken);
+    } catch (authErr) {
+      log.warn("ID token verification failed", {error: authErr.message});
+      return callableError(res, 401, "unauthenticated", "Invalid token");
+    }
+    const callerUid = decodedToken.uid;
+
+    const {orgId, purchaseId, transactionId, lastFourDigits} =
+      (req.body && req.body.data) || {};
+    if (!orgId || !purchaseId) {
+      return callableError(res, 400, "invalid-argument",
+          "Missing required fields: orgId, purchaseId");
+    }
+
+    const purchaseRef = admin.database()
+        .ref(`organizations/${orgId}/purchases/${purchaseId}`);
+    const purchaseSnapshot = await purchaseRef.once("value");
+    const purchase = purchaseSnapshot.val();
+    if (!purchase) {
+      return callableError(res, 404, "not-found", "הרכישה לא נמצאה");
+    }
+    if (purchase.userId !== callerUid) {
+      return callableError(res, 403, "permission-denied", "אין הרשאה לרכישה זו");
+    }
+    if (purchase.status === "completed" && purchase.creditedAt) {
+      log.info("Already credited (idempotent) - likely nedarimCallback " +
+        "already fired for this purchase", {orgId, purchaseId});
+      return callableOk(res, {success: true, message: "כבר עובד", correlationId});
+    }
+
+    const userRef = admin.database()
+        .ref(`organizations/${orgId}/users/${callerUid}`);
+    const userSnapshot = await userRef.once("value");
+    const user = userSnapshot.val();
+    if (!user) {
+      return callableError(res, 404, "not-found", "המשתמש לא נמצא");
+    }
+
+    const amount = Number(purchase.amount) || 0;
+    const currentTime = user.remainingTime || 0;
+    const currentPrintBudget = user.printBalance || 0;
+    const addingMinutes = purchase.minutes || 0;
+    const addingPrintBudget = purchase.printBudget || 0;
+    const validityDays = purchase.validityDays || 0;
+    const newTime = currentTime + (addingMinutes * 60);
+    const newPrintBudget = currentPrintBudget + addingPrintBudget;
+
+    const updatePayload = {
+      remainingTime: newTime,
+      printBalance: newPrintBudget,
+      updatedAt: new Date().toISOString(),
+      lastCreditedAt: new Date().toISOString(),
+      lastCreditedBy: "confirm-payment-client-attested",
+      correlationId,
+    };
+    if (validityDays > 0) {
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + validityDays);
+      updatePayload.timeExpiresAt = expiresAt.toISOString();
+    }
+
+    const atomicUpdate = {};
+    const userPath = `organizations/${orgId}/users/${callerUid}`;
+    for (const [key, val] of Object.entries(updatePayload)) {
+      atomicUpdate[`${userPath}/${key}`] = val;
+    }
+    const purchasePath = `organizations/${orgId}/purchases/${purchaseId}`;
+    atomicUpdate[`${purchasePath}/status`] = "completed";
+    atomicUpdate[`${purchasePath}/transactionId`] = transactionId || correlationId;
+    atomicUpdate[`${purchasePath}/creditCardNumber`] =
+      lastFourDigits ? `****${String(lastFourDigits).slice(-4)}` : "";
+    atomicUpdate[`${purchasePath}/amount`] = amount;
+    atomicUpdate[`${purchasePath}/creditedAt`] = new Date().toISOString();
+    atomicUpdate[`${purchasePath}/creditedUserId`] = callerUid;
+    atomicUpdate[`${purchasePath}/creditedBy`] = "confirm-payment-client-attested";
+    atomicUpdate[`${purchasePath}/correlationId`] = correlationId;
+    await admin.database().ref().update(atomicUpdate);
+
+    log.info("User credited via client-attested confirmPayment " +
+      "(nedarimCallback webhook did not arrive)", {orgId, callerUid, purchaseId});
+
+    return callableOk(res, {success: true, message: "התשלום אושר", correlationId});
+  } catch (error) {
+    log.error("Error confirming payment", error, {correlationId});
+    return callableError(res, 500, "internal", error.message || "שגיאה באישור תשלום");
+  }
+});
+
 app.get("/", (req, res) => res.status(200).send("SIONYX payment bridge is up"));
 
 const PORT = process.env.PORT || 3000;
