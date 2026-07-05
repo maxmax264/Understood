@@ -629,6 +629,17 @@ app.post("/confirmPayment", async (req, res) => {
       expiresAt.setDate(expiresAt.getDate() + validityDays);
       updatePayload.timeExpiresAt = expiresAt.toISOString();
     }
+    // Save the card token if one came back (CreateToken flow) - mirrors
+    // nedarimCallback's identical logic. This has to be duplicated here
+    // because nedarimCallback's webhook currently never arrives (see the
+    // comment above this endpoint), so this is the only path that
+    // actually runs today.
+    if (transactionId) {
+      updatePayload.savedCard = {
+        kevaId: transactionId,
+        savedAt: new Date().toISOString(),
+      };
+    }
 
     const atomicUpdate = {};
     const userPath = `organizations/${orgId}/users/${callerUid}`;
