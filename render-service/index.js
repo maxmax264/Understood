@@ -279,6 +279,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     const idToken = authHeader.startsWith("Bearer ") ?
       authHeader.slice(7) : null;
     if (!idToken) {
+      log.warn("chargeWithSavedCard: no Authorization header");
       return callableError(res, 401, "unauthenticated", "Must be authenticated");
     }
     let decodedToken;
@@ -291,7 +292,15 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     const callerUid = decodedToken.uid;
 
     const {orgId, purchaseId, kevaId} = (req.body && req.body.data) || {};
+    log.info("chargeWithSavedCard: request received", {
+      orgId, purchaseId, callerUid,
+      kevaIdPresent: !!kevaId,
+      bodyKeys: Object.keys((req.body && req.body.data) || {}),
+    });
     if (!orgId || !purchaseId || !kevaId) {
+      log.warn("chargeWithSavedCard: missing required fields", {
+        hasOrgId: !!orgId, hasPurchaseId: !!purchaseId, hasKevaId: !!kevaId,
+      });
       return callableError(res, 400, "invalid-argument",
           "Missing required fields: orgId, purchaseId, kevaId");
     }
@@ -301,12 +310,23 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     const purchaseSnapshot = await purchaseRef.once("value");
     const purchase = purchaseSnapshot.val();
     if (!purchase) {
+      log.warn("chargeWithSavedCard: purchase not found", {orgId, purchaseId});
       return callableError(res, 404, "not-found", "הרכישה לא נמצאה");
     }
+    log.info("chargeWithSavedCard: purchase loaded", {
+      orgId, purchaseId, purchaseStatus: purchase.status,
+      purchaseUserId: purchase.userId, purchaseAmount: purchase.amount,
+    });
     if (purchase.userId !== callerUid) {
+      log.warn("chargeWithSavedCard: purchase belongs to a different user", {
+        orgId, purchaseId, purchaseUserId: purchase.userId, callerUid,
+      });
       return callableError(res, 403, "permission-denied", "אין הרשאה לרכישה זו");
     }
     if (purchase.status === "completed" && purchase.creditedAt) {
+      log.info("chargeWithSavedCard: already completed (idempotent no-op)", {
+        orgId, purchaseId,
+      });
       return callableOk(res, {
         success: true, message: "כבר עובד (idempotent)", correlationId,
       });
@@ -317,9 +337,17 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     const userSnapshot = await userRef.once("value");
     const user = userSnapshot.val();
     if (!user) {
+      log.warn("chargeWithSavedCard: user not found", {orgId, callerUid});
       return callableError(res, 404, "not-found", "המשתמש לא נמצא");
     }
     const storedKevaId = user.savedCard && user.savedCard.kevaId;
+    log.info("chargeWithSavedCard: saved-card check", {
+      orgId, callerUid,
+      hasSavedCard: !!user.savedCard,
+      storedKevaIdMasked: storedKevaId ? `${storedKevaId.slice(0, 3)}***` : null,
+      requestKevaIdMasked: kevaId ? `${kevaId.slice(0, 3)}***` : null,
+      match: storedKevaId === kevaId,
+    });
     if (!storedKevaId || storedKevaId !== kevaId) {
       log.warn("KevaId mismatch or missing - possible tampering", {callerUid, orgId});
       return callableError(res, 403, "permission-denied", "כרטיס שמור לא תקין");
@@ -333,7 +361,16 @@ app.post("/chargeWithSavedCard", async (req, res) => {
       (tryDecrypt(meta.nedarim_mosad_id)) : "";
     const apiPassword = meta.nedarim_api_valid ?
       (tryDecrypt(meta.nedarim_api_valid)) : "";
+    log.info("chargeWithSavedCard: nedarim credentials loaded from metadata", {
+      orgId,
+      metaHasMosadIdField: "nedarim_mosad_id" in meta,
+      metaHasApiValidField: "nedarim_api_valid" in meta,
+      mosadIdResolved: !!mosadId,
+      apiPasswordResolved: !!apiPassword,
+    });
     if (!mosadId || !apiPassword) {
+      log.error("chargeWithSavedCard: missing Nedarim credentials after lookup",
+          null, {orgId});
       return callableError(res, 412, "failed-precondition", "חסרים פרטי התחברות לנדרים");
     }
 
@@ -383,64 +420,107 @@ app.post("/chargeWithSavedCard", async (req, res) => {
       },
     ];
 
+    log.info("chargeWithSavedCard: starting attempt", {
+      orgId, purchaseId, callerUid,
+      kevaIdMasked: kevaId ? `${kevaId.slice(0, 3)}***${kevaId.slice(-2)}` : "(empty)",
+      amount,
+      mosadIdPresent: !!mosadId,
+      mosadIdLength: mosadId ? String(mosadId).length : 0,
+      apiPasswordPresent: !!apiPassword,
+      apiPasswordLength: apiPassword ? String(apiPassword).length : 0,
+      strategiesCount: 3,
+    });
+
     let parsed = null;
     let optionUsed = null;
     const attemptsLog = [];
 
     for (const strategy of strategies) {
       const tag = `[SAVED-CARD OPTION ${strategy.option}]`;
+      const maskedParams = {};
+      for (const [k, v] of Object.entries(strategy.params)) {
+        maskedParams[k] = (k === "ApiPassword" || k === "ApiValid")
+          ? `${String(v).slice(0, 2)}***${String(v).slice(-2)}`
+          : v;
+      }
       log.info(`${tag} Attempting Nedarim TashlumBodedNew`, {
         orgId, purchaseId, option: strategy.option, label: strategy.label,
+        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
+        paramsSent: maskedParams,
       });
 
+      const attemptStart = Date.now();
       let responseText;
+      let httpStatus = null;
       try {
         const nedarimResponse = await fetch(
             "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
             {method: "POST", body: new URLSearchParams(strategy.params)},
         );
+        httpStatus = nedarimResponse.status;
         responseText = await nedarimResponse.text();
       } catch (fetchErr) {
-        log.error(`${tag} Network error`, fetchErr, {orgId, purchaseId});
+        log.error(`${tag} Network error`, fetchErr, {
+          orgId, purchaseId, durationMs: Date.now() - attemptStart,
+        });
         attemptsLog.push({option: strategy.option, error: "network-error"});
         continue;
       }
+      const durationMs = Date.now() - attemptStart;
+
+      log.info(`${tag} Raw HTTP response from Nedarim`, {
+        orgId, purchaseId, option: strategy.option,
+        httpStatus, durationMs,
+        rawResponseFull: responseText.slice(0, 2000),
+        rawResponseLength: responseText.length,
+      });
 
       let attemptParsed;
       try {
         attemptParsed = JSON.parse(responseText);
       } catch (parseErr) {
-        log.error(`${tag} Failed to parse response`, parseErr, {
-          orgId, purchaseId, rawResponseSample: responseText.slice(0, 200),
+        log.error(`${tag} Failed to parse response as JSON`, parseErr, {
+          orgId, purchaseId, rawResponseSample: responseText.slice(0, 500),
         });
         attemptsLog.push({option: strategy.option, error: "parse-error"});
         continue;
       }
 
-      log.info(`${tag} Response received`, {
+      log.info(`${tag} Parsed response`, {
         orgId, purchaseId, status: attemptParsed.Status,
         message: attemptParsed.Message,
+        fullParsedResponse: attemptParsed,
       });
       attemptsLog.push({
         option: strategy.option, status: attemptParsed.Status,
-        message: attemptParsed.Message,
+        message: attemptParsed.Message, durationMs,
       });
 
       if (attemptParsed.Status === "OK") {
-        log.info(`${tag} SUCCEEDED - this is the working option`);
+        log.info(`${tag} SUCCEEDED - this is the working option`, {
+          orgId, purchaseId, durationMs,
+        });
         parsed = attemptParsed;
         optionUsed = strategy.option;
         break;
       }
       if (isStructuralFailure(attemptParsed.Message)) {
-        log.warn(`${tag} Structural failure, trying next option`);
+        log.warn(`${tag} Structural failure, trying next option`, {
+          orgId, purchaseId, message: attemptParsed.Message, durationMs,
+        });
         continue;
       }
-      log.warn(`${tag} Real decline - stopping, not trying more options`);
+      log.warn(`${tag} Real decline - stopping, not trying more options`, {
+        orgId, purchaseId, message: attemptParsed.Message, durationMs,
+      });
       parsed = attemptParsed;
       optionUsed = strategy.option;
       break;
     }
+
+    log.info("chargeWithSavedCard: all attempts finished", {
+      orgId, purchaseId, optionUsed, attemptsSummary: attemptsLog,
+    });
 
     if (!parsed) {
       log.error("All saved-card charge options failed structurally", null, {
@@ -565,6 +645,7 @@ app.post("/confirmPayment", async (req, res) => {
     const idToken = authHeader.startsWith("Bearer ") ?
       authHeader.slice(7) : null;
     if (!idToken) {
+      log.warn("confirmPayment: no Authorization header");
       return callableError(res, 401, "unauthenticated", "Must be authenticated");
     }
     let decodedToken;
@@ -578,7 +659,15 @@ app.post("/confirmPayment", async (req, res) => {
 
     const {orgId, purchaseId, transactionId, lastFourDigits} =
       (req.body && req.body.data) || {};
+    log.info("confirmPayment: request received", {
+      orgId, purchaseId, callerUid,
+      transactionId, lastFourDigits,
+      bodyKeys: Object.keys((req.body && req.body.data) || {}),
+    });
     if (!orgId || !purchaseId) {
+      log.warn("confirmPayment: missing required fields", {
+        hasOrgId: !!orgId, hasPurchaseId: !!purchaseId,
+      });
       return callableError(res, 400, "invalid-argument",
           "Missing required fields: orgId, purchaseId");
     }
@@ -588,9 +677,18 @@ app.post("/confirmPayment", async (req, res) => {
     const purchaseSnapshot = await purchaseRef.once("value");
     const purchase = purchaseSnapshot.val();
     if (!purchase) {
+      log.warn("confirmPayment: purchase not found", {orgId, purchaseId});
       return callableError(res, 404, "not-found", "הרכישה לא נמצאה");
     }
+    log.info("confirmPayment: purchase loaded", {
+      orgId, purchaseId, purchaseStatus: purchase.status,
+      purchaseUserId: purchase.userId, purchaseAmount: purchase.amount,
+      purchaseMinutes: purchase.minutes, purchasePrintBudget: purchase.printBudget,
+    });
     if (purchase.userId !== callerUid) {
+      log.warn("confirmPayment: purchase belongs to a different user", {
+        orgId, purchaseId, purchaseUserId: purchase.userId, callerUid,
+      });
       return callableError(res, 403, "permission-denied", "אין הרשאה לרכישה זו");
     }
     if (purchase.status === "completed" && purchase.creditedAt) {
@@ -604,6 +702,7 @@ app.post("/confirmPayment", async (req, res) => {
     const userSnapshot = await userRef.once("value");
     const user = userSnapshot.val();
     if (!user) {
+      log.warn("confirmPayment: user not found", {orgId, callerUid});
       return callableError(res, 404, "not-found", "המשתמש לא נמצא");
     }
 
@@ -615,6 +714,11 @@ app.post("/confirmPayment", async (req, res) => {
     const validityDays = purchase.validityDays || 0;
     const newTime = currentTime + (addingMinutes * 60);
     const newPrintBudget = currentPrintBudget + addingPrintBudget;
+    log.info("confirmPayment: computed credit", {
+      orgId, purchaseId, callerUid,
+      currentTime, currentPrintBudget, addingMinutes, addingPrintBudget,
+      newTime, newPrintBudget, amount,
+    });
 
     const updatePayload = {
       remainingTime: newTime,
