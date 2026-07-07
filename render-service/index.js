@@ -197,7 +197,7 @@ app.post("/nedarimCallback", async (req, res) => {
       `****${String(CreditCardNumber).slice(-4)}` : "";
 
     await purchaseRef.update({
-      status: Status === "Error" ? "failed" : "completed",
+      status: Status === "OK" ? "completed" : "failed",
       transactionId: TransactionId,
       amount: amountNum,
       creditCardNumber: maskedCardForStorage,
@@ -207,7 +207,7 @@ app.post("/nedarimCallback", async (req, res) => {
       processedAt: new Date().toISOString(),
     });
 
-    if (Status !== "Error" && purchase.userId) {
+    if (Status === "OK" && purchase.userId) {
       const userRef = admin.database()
           .ref(`organizations/${orgId}/users/${purchase.userId}`);
       const userSnapshot = await userRef.once("value");
