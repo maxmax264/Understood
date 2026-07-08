@@ -31,6 +31,13 @@ const express = require("express");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 
+// This server's own public URL, used to build the CallBack= param sent to
+// Nedarim on the saved-card recurring charge (TashlumBodedNew) - per the
+// reference implementation, Nedarim expects CallBack on *every* charge
+// request, not just relying on something pre-registered account-wide.
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || "https://understood-n5ok.onrender.com";
+
 // ── Firebase Admin init ──────────────────────────────────────────────
 const serviceAccountB64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 if (!serviceAccountB64) {
@@ -150,7 +157,8 @@ app.post("/nedarimCallback", async (req, res) => {
 
     const paymentData = req.body || {};
     const {Amount, CreditCardNumber, Param1, Param2, Message} = paymentData;
-    const newCardToken = paymentData.Token || paymentData.KevaId || "";
+    const newCardToken = paymentData.KevaId || paymentData.Tokef ||
+      paymentData.Token || paymentData.TransactionToken || "";
     const TransactionId = paymentData.TransactionId;
     const Status = paymentData.Status;
 
@@ -388,6 +396,8 @@ app.post("/chargeWithSavedCard", async (req, res) => {
           (hint) => m.includes(hint.toLowerCase()));
     };
 
+    const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
+
     const strategies = [
       {
         option: 1,
@@ -397,6 +407,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
           ApiPassword: apiPassword, Currency: "1", KevaId: kevaId,
           Amount: amount.toFixed(0), Tashloumim: "1",
           JoinToKevaId: "NoJoin", Comments: `Purchase:${purchaseId}`,
+          CallBack: callbackUrl,
         },
       },
       {
@@ -407,6 +418,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
           Currency: "1", KevaId: kevaId, Amount: amount.toFixed(0),
           Tashlumim: "1", JoinToKevaId: "NoJoin",
           Comment: `Purchase:${purchaseId}`, Param1: purchaseId, Param2: orgId,
+          CallBack: callbackUrl,
         },
       },
       {
@@ -416,6 +428,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
           Action: "TashlumBodedNew", MosadId: mosadId, ApiValid: apiPassword,
           Currency: "1", Token: kevaId, Amount: amount.toFixed(0),
           Tashloumim: "1", Avour: `Purchase:${purchaseId}`,
+          CallBack: callbackUrl,
         },
       },
     ];
