@@ -57,6 +57,32 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({extended: true}));
 
+// ═══════════════════════════════════════════════════════════════════
+// DIAGNOSTIC: log absolutely every incoming request, to ANY path, no
+// matter what. This settles definitively whether Nedarim's servers ever
+// reach us at all (vs. our own client-side reporting being the only
+// thing that ever runs) - even if they hit a path we didn't expect.
+// Safe to remove once nedarimCallback is confirmed reliably firing.
+// ═══════════════════════════════════════════════════════════════════
+app.use((req, res, next) => {
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify({
+    level: "INFO",
+    message: "[CATCH-ALL] Incoming request",
+    timestamp: new Date().toISOString(),
+    method: req.method,
+    path: req.path,
+    query: req.query,
+    headers: {
+      "user-agent": req.headers["user-agent"],
+      "content-type": req.headers["content-type"],
+      "x-forwarded-for": req.headers["x-forwarded-for"],
+    },
+    bodyPreview: JSON.stringify(req.body || {}).slice(0, 500),
+  }));
+  next();
+});
+
 // ── Logging / helper utilities (ported as-is from functions/index.js) ──
 const createLogger = (context = {}) => {
   const baseContext = {
