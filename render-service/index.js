@@ -186,7 +186,7 @@ app.post("/nedarimCallback", async (req, res) => {
     const newCardToken = paymentData.KevaId || paymentData.Tokef ||
       paymentData.Token || paymentData.TransactionToken || "";
     const TransactionId = paymentData.TransactionId;
-    const Status = paymentData.Status;
+    const Status = paymentData.Result || paymentData.Status;
 
     const amountNum = Amount != null ? Number(Amount) : NaN;
     if (Number.isNaN(amountNum) || amountNum < 0) {
@@ -414,7 +414,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     const structuralFailureHints = [
       "מוסד", "לא נמצא", "not found", "פעולה לא מוכרת",
       "unrecognized", "invalid action", "פרמטר", "parameter",
-      "לא מזוהה", "unauthorized",
+      "לא מזוהה", "unauthorized", "no action", "אין פעולה",
     ];
     const isStructuralFailure = (message) => {
       const m = (message || "").toLowerCase();
@@ -525,17 +525,22 @@ app.post("/chargeWithSavedCard", async (req, res) => {
         continue;
       }
 
+      // CRITICAL: Nedarim's real TashlumBodedNew response uses "Result",
+      // not "Status" (confirmed live: {"Result":"Error","Message":"..."}) -
+      // normalize so success/failure detection works either way.
+      const resultStatus = attemptParsed.Result || attemptParsed.Status;
+
       log.info(`${tag} Parsed response`, {
-        orgId, purchaseId, status: attemptParsed.Status,
+        orgId, purchaseId, status: resultStatus,
         message: attemptParsed.Message,
         fullParsedResponse: attemptParsed,
       });
       attemptsLog.push({
-        option: strategy.option, status: attemptParsed.Status,
+        option: strategy.option, status: resultStatus,
         message: attemptParsed.Message, durationMs,
       });
 
-      if (attemptParsed.Status === "OK") {
+      if (resultStatus === "OK") {
         log.info(`${tag} SUCCEEDED - this is the working option`, {
           orgId, purchaseId, durationMs,
         });
@@ -577,7 +582,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
       });
     }
 
-    const status = parsed.Status;
+    const status = parsed.Result || parsed.Status;
     const transactionId = parsed.Id || parsed.TransactionId || correlationId;
 
     if (status !== "OK") {
