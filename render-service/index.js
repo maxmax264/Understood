@@ -701,11 +701,11 @@ app.post("/confirmPayment", async (req, res) => {
     }
     const callerUid = decodedToken.uid;
 
-    const {orgId, purchaseId, transactionId, lastFourDigits} =
+    const {orgId, purchaseId, transactionId, lastFourDigits, tokenOnly} =
       (req.body && req.body.data) || {};
     log.info("confirmPayment: request received", {
       orgId, purchaseId, callerUid,
-      transactionId, lastFourDigits,
+      transactionId, lastFourDigits, tokenOnly,
       bodyKeys: Object.keys((req.body && req.body.data) || {}),
     });
     if (!orgId || !purchaseId) {
@@ -748,6 +748,39 @@ app.post("/confirmPayment", async (req, res) => {
     if (!user) {
       log.warn("confirmPayment: user not found", {orgId, callerUid});
       return callableError(res, 404, "not-found", "המשתמש לא נמצא");
+    }
+
+    // ── tokenOnly: the iframe ran PaymentType=CreateToken (first payment +
+    // "save card"). We've seen Nedarim return Status:OK with a real Token
+    // here even when no charge actually lands on the card statement, so
+    // this branch never credits anything - it just persists the token.
+    // The caller (WPF) is expected to immediately follow up with a real
+    // chargeWithSavedCard call using this token, which credits the user
+    // only on an explicit, separately-verified TashlumBodedNew success.
+    // This purchase record is left uncompleted; the follow-up charge
+    // creates its own purchase record that actually gets credited.
+    if (tokenOnly) {
+      if (!transactionId) {
+        log.warn("confirmPayment: tokenOnly=true but no transactionId given",
+            {orgId, purchaseId, callerUid});
+        return callableError(res, 400, "invalid-argument",
+            "tokenOnly requires transactionId");
+      }
+      await userRef.update({
+        savedCard: {
+          kevaId: transactionId,
+          savedAt: new Date().toISOString(),
+        },
+      });
+      await purchaseRef.update({
+        status: "token-saved-not-charged",
+        note: "CreateToken succeeded; awaiting explicit chargeWithSavedCard follow-up",
+        updatedAt: new Date().toISOString(),
+        correlationId,
+      });
+      log.info("confirmPayment: saved card token only, no credit issued",
+          {orgId, callerUid, purchaseId});
+      return callableOk(res, {success: true, tokenSaved: true, message: "כרטיס נשמר", correlationId});
     }
 
     const amount = Number(purchase.amount) || 0;
