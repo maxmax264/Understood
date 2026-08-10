@@ -658,6 +658,217 @@ function tryDecrypt(value) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// POST /debugChargeToken - test harness only, no crediting/purchase
+// side effects. Tries ONE named strategy against the caller's saved
+// token and returns the raw HTTP response from Nedarim untouched, so a
+// human can read exactly what came back instead of a sanitized
+// success/fail. Built because chargeWithSavedCard's existing 3
+// strategies (all POSTing Action=TashlumBodedNew to
+// nedarimplus/Reports/Manage3.aspx) always return "No Action" - that
+// URL looks like a reporting endpoint, not a charge endpoint. Forum
+// research (mitmachim.top/tchumim.com/prog.co.il, Aug 2026) turned up
+// different, actually-documented endpoints:
+//   https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx
+//   https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx
+// both GET-based with a Token= field for charging a previously-saved
+// card instead of raw card details. Also found explicit Nedarim
+// support correspondence stating direct API charging requires PCI-DSS
+// licensing and may be blocked entirely without it - so "No Action"
+// might be Nedarim deliberately refusing an unlicensed direct charge,
+// not a parameter-naming issue. These strategies exist to find out
+// which (if any) actually work for this Mosad's account.
+// Body: {"data": {orgId, strategy}}
+// ═══════════════════════════════════════════════════════════════════
+app.post("/debugChargeToken", async (req, res) => {
+  const correlationId = generateCorrelationId();
+  const log = createLogger({correlationId, service: "debug-charge-token"});
+
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ?
+      authHeader.slice(7) : null;
+    if (!idToken) {
+      return callableError(res, 401, "unauthenticated", "Must be authenticated");
+    }
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(idToken);
+    } catch (authErr) {
+      return callableError(res, 401, "unauthenticated", "Invalid token");
+    }
+    const callerUid = decodedToken.uid;
+
+    const {orgId, strategy} = (req.body && req.body.data) || {};
+    log.info("debugChargeToken: request received", {orgId, strategy, callerUid});
+    if (!orgId || !strategy) {
+      return callableError(res, 400, "invalid-argument", "orgId and strategy required");
+    }
+
+    const userRef = admin.database()
+        .ref(`organizations/${orgId}/users/${callerUid}`);
+    const userSnapshot = await userRef.once("value");
+    const user = userSnapshot.val();
+    const kevaId = user && user.savedCard && user.savedCard.kevaId;
+    if (!kevaId) {
+      return callableOk(res, {
+        success: false, error: "אין כרטיס שמור למשתמש הזה - שמור כרטיס קודם",
+        correlationId,
+      });
+    }
+
+    const metaRef = admin.database().ref(`organizations/${orgId}/metadata`);
+    const metaSnapshot = await metaRef.once("value");
+    const meta = metaSnapshot.val() || {};
+    const mosadId = meta.nedarim_mosad_id ? tryDecrypt(meta.nedarim_mosad_id) : "";
+    const apiPassword = meta.nedarim_api_valid ? tryDecrypt(meta.nedarim_api_valid) : "";
+    if (!mosadId || !apiPassword) {
+      return callableOk(res, {
+        success: false, error: "חסרים פרטי התחברות לנדרים במטא־דאטה",
+        correlationId,
+      });
+    }
+
+    // Small fixed test amount - this WILL attempt a real charge against
+    // Nedarim's live system (there is no sandbox), so keep it tiny.
+    const amount = "1";
+    const today = new Date();
+    const dayOfMonth = String(today.getDate());
+    const startFrom = `${String(today.getDate()).padStart(2, "0")}${String(today.getMonth() + 1).padStart(2, "0")}${today.getFullYear()}`;
+    const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
+
+    const strategyDefs = {
+      // Original 3 - kept for completeness/comparison.
+      manage3_v1: {
+        method: "POST",
+        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
+        params: {
+          Action: "TashlumBodedNew", MosadNumber: mosadId,
+          ApiPassword: apiPassword, Currency: "1", KevaId: kevaId,
+          Amount: amount, Tashloumim: "1", JoinToKevaId: "NoJoin",
+          Comments: "SIONYX-debug-test", CallBack: callbackUrl,
+        },
+      },
+      manage3_v2: {
+        method: "POST",
+        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
+        params: {
+          Action: "TashlumBodedNew", Mosad: mosadId, ApiValid: apiPassword,
+          Currency: "1", KevaId: kevaId, Amount: amount, Tashlumim: "1",
+          JoinToKevaId: "NoJoin", Comment: "SIONYX-debug-test",
+          CallBack: callbackUrl,
+        },
+      },
+      manage3_v3: {
+        method: "POST",
+        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
+        params: {
+          Action: "TashlumBodedNew", MosadId: mosadId, ApiValid: apiPassword,
+          Currency: "1", Token: kevaId, Amount: amount, Tashloumim: "1",
+          Avour: "SIONYX-debug-test", CallBack: callbackUrl,
+        },
+      },
+      // New: forum-documented DebitCard.aspx, using Token= instead of
+      // CardNumber/Tokef/CVV to charge the previously-saved card.
+      debitcard_token: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
+        params: {
+          Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
+          ClientId: "", CardNumber: "", Tokef: "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
+          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
+          MasofId: "Online",
+        },
+      },
+      // Same, but with ApiValid appended - none of the forum examples
+      // showed an auth param on this endpoint, worth testing both ways.
+      debitcard_token_apivalid: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
+        params: {
+          Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
+          ClientId: "", CardNumber: "", Tokef: "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
+          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
+          MasofId: "Online", ApiValid: apiPassword,
+        },
+      },
+      // New: forum-documented DebitKeva.aspx (standing-order specific
+      // endpoint, different URL/params from DebitCard.aspx entirely).
+      debitkeva_token: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+        params: {
+          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+          Phone: "", CardNumber: "", Tokef: "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Day: dayOfMonth, StartFrom: startFrom, Zeout: "",
+          Currency: "1", MasofId: "Online", Token: kevaId,
+          ApiValid: apiPassword,
+        },
+      },
+    };
+
+    const def = strategyDefs[strategy];
+    if (!def) {
+      return callableOk(res, {
+        success: false,
+        error: `Unknown strategy: ${strategy}. Valid: ${Object.keys(strategyDefs).join(", ")}`,
+        correlationId,
+      });
+    }
+
+    const maskedParams = {...def.params};
+    if (maskedParams.ApiPassword) maskedParams.ApiPassword = "***";
+    if (maskedParams.ApiValid) maskedParams.ApiValid = "***";
+    if (maskedParams.Token) maskedParams.Token = `${String(maskedParams.Token).slice(0, 3)}***`;
+
+    log.info(`[DEBUG-CHARGE ${strategy}] Sending`, {
+      method: def.method, url: def.url, params: maskedParams,
+    });
+
+    let fetchUrl = def.url;
+    let fetchOptions = {method: def.method};
+    if (def.method === "GET") {
+      fetchUrl = `${def.url}?${new URLSearchParams(def.params)}`;
+    } else {
+      fetchOptions.body = new URLSearchParams(def.params);
+    }
+
+    const attemptStart = Date.now();
+    let responseText;
+    let httpStatus = null;
+    try {
+      const nedarimResponse = await fetch(fetchUrl, fetchOptions);
+      httpStatus = nedarimResponse.status;
+      responseText = await nedarimResponse.text();
+    } catch (fetchErr) {
+      log.error(`[DEBUG-CHARGE ${strategy}] Network error`, fetchErr, {correlationId});
+      return callableOk(res, {
+        success: false, error: `Network error: ${fetchErr.message}`,
+        strategy, correlationId,
+      });
+    }
+    const durationMs = Date.now() - attemptStart;
+
+    log.info(`[DEBUG-CHARGE ${strategy}] Raw response`, {
+      httpStatus, durationMs, rawResponseFull: responseText.slice(0, 3000),
+    });
+
+    return callableOk(res, {
+      success: true, // means "we got a response", not "charge succeeded"
+      strategy, httpStatus, durationMs,
+      rawResponse: responseText.slice(0, 3000),
+      urlUsed: def.url, methodUsed: def.method,
+      correlationId,
+    });
+  } catch (error) {
+    log.error("Error in debugChargeToken", error, {correlationId});
+    return callableError(res, 500, "internal", error.message || "שגיאה");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
 // POST /confirmPayment - client-attested fallback for the regular
 // (non-saved-card) iframe flow.
 //
