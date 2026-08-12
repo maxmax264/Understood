@@ -737,82 +737,14 @@ app.post("/debugChargeToken", async (req, res) => {
     const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
 
     const strategyDefs = {
-      // Original 3 - kept for completeness/comparison.
-      manage3_v1: {
-        method: "POST",
-        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
-        params: {
-          Action: "TashlumBodedNew", MosadNumber: mosadId,
-          ApiPassword: apiPassword, Currency: "1", KevaId: kevaId,
-          Amount: amount, Tashloumim: "1", JoinToKevaId: "NoJoin",
-          Comments: "SIONYX-debug-test", CallBack: callbackUrl,
-        },
-      },
-      manage3_v2: {
-        method: "POST",
-        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
-        params: {
-          Action: "TashlumBodedNew", Mosad: mosadId, ApiValid: apiPassword,
-          Currency: "1", KevaId: kevaId, Amount: amount, Tashlumim: "1",
-          JoinToKevaId: "NoJoin", Comment: "SIONYX-debug-test",
-          CallBack: callbackUrl,
-        },
-      },
-      manage3_v3: {
-        method: "POST",
-        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
-        params: {
-          Action: "TashlumBodedNew", MosadId: mosadId, ApiValid: apiPassword,
-          Currency: "1", Token: kevaId, Amount: amount, Tashloumim: "1",
-          Avour: "SIONYX-debug-test", CallBack: callbackUrl,
-        },
-      },
-      // New: forum-documented DebitCard.aspx, using Token= instead of
-      // CardNumber/Tokef/CVV to charge the previously-saved card.
-      debitcard_token: {
-        method: "GET",
-        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
-        params: {
-          Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
-          ClientId: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
-          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
-          MasofId: "Online",
-        },
-      },
-      // Same, but with ApiValid appended - none of the forum examples
-      // showed an auth param on this endpoint, worth testing both ways.
-      debitcard_token_apivalid: {
-        method: "GET",
-        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
-        params: {
-          Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
-          ClientId: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
-          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
-          MasofId: "Online", ApiValid: apiPassword,
-        },
-      },
-      // New: forum-documented DebitKeva.aspx (standing-order specific
-      // endpoint, different URL/params from DebitCard.aspx entirely).
-      debitkeva_token: {
-        method: "GET",
-        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
-        params: {
-          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
-          Phone: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
-          Day: dayOfMonth, StartFrom: startFrom, Zeout: "",
-          Currency: "1", MasofId: "Online", Token: kevaId,
-          ApiValid: apiPassword,
-        },
-      },
-      // Requires tokef to be provided - explicit variants so a missing
-      // tokef fails loudly instead of silently sending an empty string,
-      // for testing the hypothesis that Nedarim needs the ORIGINAL card's
-      // real expiry resent alongside the token, not just the token alone
-      // ("מבנה תוקף לא תקין" on debitkeva_token with an empty Tokef could
-      // mean exactly that, not "tokens aren't supported here at all").
+      // Manage3.aspx (Action=TashlumBodedNew) strategies removed after
+      // confirming wrong credentials there trigger Nedarim's IP-ban
+      // counter ("נסיון X מתוך 10... כתובת ה-IP תיחסם לשעה") - not worth
+      // the risk now that we know the credentials are wrong regardless.
+      // DebitCard.aspx/DebitKeva.aspx without a real Tokef removed too -
+      // confirmed dead ends (CAPTCHA-blocked / "מבנה תוקף לא תקין").
+      // Only the Tokef-required variants remain, testing the hypothesis
+      // that Nedarim needs the card's real expiry resent with the token.
       debitcard_token_with_tokef: {
         method: "GET",
         url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
