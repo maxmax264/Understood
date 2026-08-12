@@ -698,8 +698,8 @@ app.post("/debugChargeToken", async (req, res) => {
     }
     const callerUid = decodedToken.uid;
 
-    const {orgId, strategy} = (req.body && req.body.data) || {};
-    log.info("debugChargeToken: request received", {orgId, strategy, callerUid});
+    const {orgId, strategy, tokef} = (req.body && req.body.data) || {};
+    log.info("debugChargeToken: request received", {orgId, strategy, tokefProvided: !!tokef, callerUid});
     if (!orgId || !strategy) {
       return callableError(res, 400, "invalid-argument", "orgId and strategy required");
     }
@@ -774,7 +774,7 @@ app.post("/debugChargeToken", async (req, res) => {
         url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
         params: {
           Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
-          ClientId: "", CardNumber: "", Tokef: "", Amount: amount,
+          ClientId: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
           Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
           Token: kevaId, CVV: "", Zeout: "", Currency: "1",
           MasofId: "Online",
@@ -787,7 +787,7 @@ app.post("/debugChargeToken", async (req, res) => {
         url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
         params: {
           Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
-          ClientId: "", CardNumber: "", Tokef: "", Amount: amount,
+          ClientId: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
           Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
           Token: kevaId, CVV: "", Zeout: "", Currency: "1",
           MasofId: "Online", ApiValid: apiPassword,
@@ -800,12 +800,43 @@ app.post("/debugChargeToken", async (req, res) => {
         url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
         params: {
           MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
-          Phone: "", CardNumber: "", Tokef: "", Amount: amount,
+          Phone: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
           Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
           Day: dayOfMonth, StartFrom: startFrom, Zeout: "",
           Currency: "1", MasofId: "Online", Token: kevaId,
           ApiValid: apiPassword,
         },
+      },
+      // Requires tokef to be provided - explicit variants so a missing
+      // tokef fails loudly instead of silently sending an empty string,
+      // for testing the hypothesis that Nedarim needs the ORIGINAL card's
+      // real expiry resent alongside the token, not just the token alone
+      // ("מבנה תוקף לא תקין" on debitkeva_token with an empty Tokef could
+      // mean exactly that, not "tokens aren't supported here at all").
+      debitcard_token_with_tokef: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
+        params: {
+          Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
+          ClientId: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
+          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
+          MasofId: "Online", ApiValid: apiPassword,
+        },
+        requiresTokef: true,
+      },
+      debitkeva_token_with_tokef: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+        params: {
+          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+          Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Day: dayOfMonth, StartFrom: startFrom, Zeout: "",
+          Currency: "1", MasofId: "Online", Token: kevaId,
+          ApiValid: apiPassword,
+        },
+        requiresTokef: true,
       },
     };
 
@@ -814,6 +845,13 @@ app.post("/debugChargeToken", async (req, res) => {
       return callableOk(res, {
         success: false,
         error: `Unknown strategy: ${strategy}. Valid: ${Object.keys(strategyDefs).join(", ")}`,
+        correlationId,
+      });
+    }
+    if (def.requiresTokef && !tokef) {
+      return callableOk(res, {
+        success: false,
+        error: `Strategy '${strategy}' requires a tokef (MMYY) but none was provided`,
         correlationId,
       });
     }
