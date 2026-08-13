@@ -733,7 +733,13 @@ app.post("/debugChargeToken", async (req, res) => {
     const amount = "1";
     const today = new Date();
     const dayOfMonth = String(today.getDate());
-    const startFrom = `${String(today.getDate()).padStart(2, "0")}${String(today.getMonth() + 1).padStart(2, "0")}${today.getFullYear()}`;
+    const dd = String(today.getDate()).padStart(2, "0");
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const yyyy = String(today.getFullYear());
+    const startFrom = `${dd}${mm}${yyyy}`; // DDMMYYYY, no separators - what we already tried ("תאריך לא תקין")
+    const startFromSlashes = `${dd}/${mm}/${yyyy}`; // DD/MM/YYYY
+    const startFromIso = `${yyyy}-${mm}-${dd}`; // YYYY-MM-DD
+    const startFromCompactIso = `${yyyy}${mm}${dd}`; // YYYYMMDD
     const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
 
     const strategyDefs = {
@@ -741,22 +747,12 @@ app.post("/debugChargeToken", async (req, res) => {
       // confirming wrong credentials there trigger Nedarim's IP-ban
       // counter ("נסיון X מתוך 10... כתובת ה-IP תיחסם לשעה") - not worth
       // the risk now that we know the credentials are wrong regardless.
-      // DebitCard.aspx/DebitKeva.aspx without a real Tokef removed too -
-      // confirmed dead ends (CAPTCHA-blocked / "מבנה תוקף לא תקין").
-      // Only the Tokef-required variants remain, testing the hypothesis
-      // that Nedarim needs the card's real expiry resent with the token.
-      debitcard_token_with_tokef: {
-        method: "GET",
-        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx",
-        params: {
-          Mosad: mosadId, ClientName: "", Adresse: "", Phone: "",
-          ClientId: "", CardNumber: "", Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug",
-          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
-          MasofId: "Online", ApiValid: apiPassword,
-        },
-        requiresTokef: true,
-      },
+      // DebitCard.aspx removed entirely: confirmed CAPTCHA-blocked even
+      // with a real Tokef - categorically not usable server-to-server,
+      // tokef didn't change anything. Only DebitKeva.aspx variants remain,
+      // since a real Tokef changed its error from "מבנה תוקף לא תקין" to
+      // "תאריך לא תקין" - meaning Tokef is now accepted and StartFrom's
+      // format is the next thing to nail down.
       debitkeva_token_with_tokef: {
         method: "GET",
         url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
@@ -765,6 +761,65 @@ app.post("/debugChargeToken", async (req, res) => {
           Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
           Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
           Day: dayOfMonth, StartFrom: startFrom, Zeout: "",
+          Currency: "1", MasofId: "Online", Token: kevaId,
+          ApiValid: apiPassword,
+        },
+        requiresTokef: true,
+      },
+      // Same as above, but trying different StartFrom date formats -
+      // "מבנה תוקף לא תקין" became "תאריך לא תקין" once a real Tokef was
+      // sent, suggesting Tokef is now fine and StartFrom's DDMMYYYY (no
+      // separators) format is what Nedarim is rejecting next.
+      debitkeva_startfrom_slashes: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+        params: {
+          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+          Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Day: dayOfMonth, StartFrom: startFromSlashes, Zeout: "",
+          Currency: "1", MasofId: "Online", Token: kevaId,
+          ApiValid: apiPassword,
+        },
+        requiresTokef: true,
+      },
+      debitkeva_startfrom_iso: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+        params: {
+          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+          Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Day: dayOfMonth, StartFrom: startFromIso, Zeout: "",
+          Currency: "1", MasofId: "Online", Token: kevaId,
+          ApiValid: apiPassword,
+        },
+        requiresTokef: true,
+      },
+      debitkeva_startfrom_compact_iso: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+        params: {
+          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+          Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Day: dayOfMonth, StartFrom: startFromCompactIso, Zeout: "",
+          Currency: "1", MasofId: "Online", Token: kevaId,
+          ApiValid: apiPassword,
+        },
+        requiresTokef: true,
+      },
+      // Also try dropping StartFrom entirely - maybe it's optional and
+      // only Day is required, and StartFrom is what's actually malformed
+      // regardless of format.
+      debitkeva_no_startfrom: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+        params: {
+          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+          Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Day: dayOfMonth, Zeout: "",
           Currency: "1", MasofId: "Online", Token: kevaId,
           ApiValid: apiPassword,
         },
