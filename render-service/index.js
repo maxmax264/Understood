@@ -829,6 +829,9 @@ app.post("/debugChargeToken", async (req, res) => {
 
     const def = strategyDefs[strategy];
     if (!def) {
+      log.warn("debugChargeToken: unknown strategy requested (server may be running older code than the client)", {
+        strategy, validStrategies: Object.keys(strategyDefs),
+      });
       return callableOk(res, {
         success: false,
         error: `Unknown strategy: ${strategy}. Valid: ${Object.keys(strategyDefs).join(", ")}`,
