@@ -741,6 +741,11 @@ app.post("/debugChargeToken", async (req, res) => {
     const startFromIso = `${yyyy}-${mm}-${dd}`; // YYYY-MM-DD
     const startFromCompactIso = `${yyyy}${mm}${dd}`; // YYYYMMDD
     const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
+    // Nedarim blocks creating an "identical" standing order (same card/
+    // amount/comment) within a few minutes - append a unique suffix to
+    // Comments/Avour so repeated test runs (or real repeated top-ups)
+    // don't get silently deduped.
+    const uniqueSuffix = correlationId.slice(-8);
 
     const strategyDefs = {
       // Manage3.aspx (Action=TashlumBodedNew) strategies removed after
@@ -759,10 +764,10 @@ app.post("/debugChargeToken", async (req, res) => {
         params: {
           MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
           Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Tashloumim: "1", Groupe: "", Avour: `SIONYX-debug-${uniqueSuffix}`, CVV: "",
           Day: dayOfMonth, StartFrom: startFrom, Zeout: "",
           Currency: "1", MasofId: "Online", Token: kevaId,
-          ApiValid: apiPassword,
+          ApiValid: apiPassword, CallBack: callbackUrl,
         },
         requiresTokef: true,
       },
@@ -776,10 +781,10 @@ app.post("/debugChargeToken", async (req, res) => {
         params: {
           MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
           Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Tashloumim: "1", Groupe: "", Avour: `SIONYX-debug-${uniqueSuffix}`, CVV: "",
           Day: dayOfMonth, StartFrom: startFromSlashes, Zeout: "",
           Currency: "1", MasofId: "Online", Token: kevaId,
-          ApiValid: apiPassword,
+          ApiValid: apiPassword, CallBack: callbackUrl,
         },
         requiresTokef: true,
       },
@@ -789,10 +794,10 @@ app.post("/debugChargeToken", async (req, res) => {
         params: {
           MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
           Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Tashloumim: "1", Groupe: "", Avour: `SIONYX-debug-${uniqueSuffix}`, CVV: "",
           Day: dayOfMonth, StartFrom: startFromIso, Zeout: "",
           Currency: "1", MasofId: "Online", Token: kevaId,
-          ApiValid: apiPassword,
+          ApiValid: apiPassword, CallBack: callbackUrl,
         },
         requiresTokef: true,
       },
@@ -802,10 +807,10 @@ app.post("/debugChargeToken", async (req, res) => {
         params: {
           MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
           Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Tashloumim: "1", Groupe: "", Avour: `SIONYX-debug-${uniqueSuffix}`, CVV: "",
           Day: dayOfMonth, StartFrom: startFromCompactIso, Zeout: "",
           Currency: "1", MasofId: "Online", Token: kevaId,
-          ApiValid: apiPassword,
+          ApiValid: apiPassword, CallBack: callbackUrl,
         },
         requiresTokef: true,
       },
@@ -818,10 +823,10 @@ app.post("/debugChargeToken", async (req, res) => {
         params: {
           MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
           Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
-          Tashloumim: "1", Groupe: "", Avour: "SIONYX-debug", CVV: "",
+          Tashloumim: "1", Groupe: "", Avour: `SIONYX-debug-${uniqueSuffix}`, CVV: "",
           Day: dayOfMonth, Zeout: "",
           Currency: "1", MasofId: "Online", Token: kevaId,
-          ApiValid: apiPassword,
+          ApiValid: apiPassword, CallBack: callbackUrl,
         },
         requiresTokef: true,
       },
