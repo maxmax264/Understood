@@ -149,6 +149,22 @@ const decryptData = (encrypted) => {
   return JSON.parse(Buffer.from(encrypted, "base64").toString("utf8"));
 };
 
+// Card Tokef (expiry) is sensitive, PCI-adjacent data - encrypt it the same
+// way as other Nedarim credentials before storing (mirrors decryptData's
+// format so tryDecrypt can read it back). Falls back to plain base64 if
+// ENCRYPTION_KEY isn't configured, same as decryptData's fallback path.
+const encryptData = (value) => {
+  const key = getEncryptionKey();
+  const plaintext = JSON.stringify(value);
+  if (key) {
+    const iv = crypto.randomBytes(IV_LENGTH);
+    const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+    const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+    return `${iv.toString("base64")}:${encrypted.toString("base64")}`;
+  }
+  return Buffer.from(plaintext, "utf8").toString("base64");
+};
+
 // Small helper so responses look like the Firebase callable-function wire
 // protocol ({result: ...} / {error: {status, message}}) - this means the
 // existing WPF FirebaseClient.CallFunctionAsync code doesn't need to change
@@ -325,10 +341,10 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     }
     const callerUid = decodedToken.uid;
 
-    const {orgId, purchaseId, kevaId} = (req.body && req.body.data) || {};
+    const {orgId, purchaseId, kevaId, tokef: requestTokef} = (req.body && req.body.data) || {};
     log.info("chargeWithSavedCard: request received", {
       orgId, purchaseId, callerUid,
-      kevaIdPresent: !!kevaId,
+      kevaIdPresent: !!kevaId, tokefPresentInRequest: !!requestTokef,
       bodyKeys: Object.keys((req.body && req.body.data) || {}),
     });
     if (!orgId || !purchaseId || !kevaId) {
@@ -386,6 +402,23 @@ app.post("/chargeWithSavedCard", async (req, res) => {
       log.warn("KevaId mismatch or missing - possible tampering", {callerUid, orgId});
       return callableError(res, 403, "permission-denied", "כרטיס שמור לא תקין");
     }
+    let tokef = requestTokef || "";
+    if (user.savedCard && user.savedCard.tokef) {
+      try {
+        tokef = tryDecrypt(user.savedCard.tokef);
+      } catch (e) {
+        log.warn("chargeWithSavedCard: failed to decrypt stored tokef, falling back to request value", {orgId, callerUid});
+      }
+    }
+    log.info("chargeWithSavedCard: tokef resolved", {orgId, callerUid, tokefPresent: !!tokef, source: (user.savedCard && user.savedCard.tokef) ? "stored" : "request"});
+    if (!tokef) {
+      log.warn("chargeWithSavedCard: no tokef available (stored or request) - DebitKeva requires it", {orgId, callerUid});
+      return callableOk(res, {
+        success: false,
+        error: "לא נמצא תוקף כרטיס שמור - יש לשמור את הכרטיס מחדש",
+        correlationId,
+      });
+    }
 
     const metaRef = admin.database()
         .ref(`organizations/${orgId}/metadata`);
@@ -410,190 +443,114 @@ app.post("/chargeWithSavedCard", async (req, res) => {
 
     const amount = Number(purchase.amount) || 0;
 
-    // ── Numbered fallback strategies - identical to functions/index.js ──
-    const structuralFailureHints = [
-      "מוסד", "לא נמצא", "not found", "פעולה לא מוכרת",
-      "unrecognized", "invalid action", "פרמטר", "parameter",
-      "לא מזוהה", "unauthorized", "no action", "אין פעולה",
-    ];
-    const isStructuralFailure = (message) => {
-      const m = (message || "").toLowerCase();
-      return structuralFailureHints.some(
-          (hint) => m.includes(hint.toLowerCase()));
+    // ── DebitKeva.aspx - confirmed working live (16/08/2026): creates a
+    // real one-time standing order (Month/Tashloumim=1) that Nedarim
+    // executes IMMEDIATELY (same-minute, per their own admin panel:
+    // "בוצעו: 1" right after creation), using the saved token instead of
+    // re-entering card details. Replaced the old Manage3.aspx
+    // "TashlumBodedNew" attempts entirely - those always returned either
+    // wrong-credentials or "No Action" (that URL looks like a
+    // reports/management endpoint, not a real charge one).
+    //
+    // Two things this recipe REQUIRES that took real trial-and-error to
+    // find, both essential:
+    // - StartFrom MUST be YYYY-MM-DD (ISO). DDMMYYYY or YYYYMMDD both get
+    //   "תאריך לא תקין" even though Tokef is otherwise accepted.
+    // - Avour/Comments must be unique per call. Nedarim silently dedupes
+    //   "identical" standing orders (same card+amount+category+comment)
+    //   created within a few minutes of each other - correlationId makes
+    //   every purchase's order distinguishable.
+    const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
+    const today = new Date();
+    const dd = String(today.getDate()).padStart(2, "0");
+    const mm = String(today.getMonth() + 1).padStart(2, "0");
+    const yyyy = String(today.getFullYear());
+    const startFromIso = `${yyyy}-${mm}-${dd}`;
+    const avour = `Purchase-${purchaseId}-${correlationId.slice(-8)}`;
+
+    const debitKevaParams = {
+      MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+      Phone: "", CardNumber: kevaId, Tokef: tokef, Amount: amount.toFixed(0),
+      Tashloumim: "1", Groupe: "", Avour: avour, CVV: "",
+      Day: String(today.getDate()), StartFrom: startFromIso, Zeout: "",
+      Currency: "1", MasofId: "Online", Token: kevaId,
+      ApiValid: apiPassword, CallBack: callbackUrl,
     };
 
-    const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
-
-    const strategies = [
-      {
-        option: 1,
-        label: "MosadNumber/ApiPassword/KevaId/Tashloumim (original)",
-        params: {
-          Action: "TashlumBodedNew", MosadNumber: mosadId,
-          ApiPassword: apiPassword, Currency: "1", KevaId: kevaId,
-          Amount: amount.toFixed(0), Tashloumim: "1",
-          JoinToKevaId: "NoJoin", Comments: `Purchase:${purchaseId}`,
-          CallBack: callbackUrl,
-        },
-      },
-      {
-        option: 2,
-        label: "Mosad/ApiValid/KevaId/Tashlumim (matches iframe naming)",
-        params: {
-          Action: "TashlumBodedNew", Mosad: mosadId, ApiValid: apiPassword,
-          Currency: "1", KevaId: kevaId, Amount: amount.toFixed(0),
-          Tashlumim: "1", JoinToKevaId: "NoJoin",
-          Comment: `Purchase:${purchaseId}`, Param1: purchaseId, Param2: orgId,
-          CallBack: callbackUrl,
-        },
-      },
-      {
-        option: 3,
-        label: "MosadId/Token (DebitCard.aspx-style naming)",
-        params: {
-          Action: "TashlumBodedNew", MosadId: mosadId, ApiValid: apiPassword,
-          Currency: "1", Token: kevaId, Amount: amount.toFixed(0),
-          Tashloumim: "1", Avour: `Purchase:${purchaseId}`,
-          CallBack: callbackUrl,
-        },
-      },
-    ];
-
-    log.info("chargeWithSavedCard: starting attempt", {
-      orgId, purchaseId, callerUid,
-      kevaIdMasked: kevaId ? `${kevaId.slice(0, 3)}***${kevaId.slice(-2)}` : "(empty)",
-      amount,
-      mosadIdPresent: !!mosadId,
-      mosadIdLength: mosadId ? String(mosadId).length : 0,
-      apiPasswordPresent: !!apiPassword,
-      apiPasswordLength: apiPassword ? String(apiPassword).length : 0,
-      strategiesCount: 3,
+    const maskedParams = {...debitKevaParams};
+    maskedParams.ApiValid = `${String(apiPassword).slice(0, 2)}***`;
+    maskedParams.Token = `${String(kevaId).slice(0, 3)}***`;
+    maskedParams.CardNumber = `${String(kevaId).slice(0, 3)}***`;
+    log.info("[SAVED-CARD DebitKeva] Sending", {
+      orgId, purchaseId, callerUid, amount,
+      url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+      paramsSent: maskedParams,
     });
 
-    let parsed = null;
-    let optionUsed = null;
-    const attemptsLog = [];
-
-    for (const strategy of strategies) {
-      const tag = `[SAVED-CARD OPTION ${strategy.option}]`;
-      const maskedParams = {};
-      for (const [k, v] of Object.entries(strategy.params)) {
-        maskedParams[k] = (k === "ApiPassword" || k === "ApiValid")
-          ? `${String(v).slice(0, 2)}***${String(v).slice(-2)}`
-          : v;
-      }
-      log.info(`${tag} Attempting Nedarim TashlumBodedNew`, {
-        orgId, purchaseId, option: strategy.option, label: strategy.label,
-        url: "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
-        paramsSent: maskedParams,
-      });
-
-      const attemptStart = Date.now();
-      let responseText;
-      let httpStatus = null;
-      try {
-        const nedarimResponse = await fetch(
-            "https://matara.pro/nedarimplus/Reports/Manage3.aspx",
-            {method: "POST", body: new URLSearchParams(strategy.params)},
-        );
-        httpStatus = nedarimResponse.status;
-        responseText = await nedarimResponse.text();
-      } catch (fetchErr) {
-        log.error(`${tag} Network error`, fetchErr, {
-          orgId, purchaseId, durationMs: Date.now() - attemptStart,
-        });
-        attemptsLog.push({option: strategy.option, error: "network-error"});
-        continue;
-      }
-      const durationMs = Date.now() - attemptStart;
-
-      log.info(`${tag} Raw HTTP response from Nedarim`, {
-        orgId, purchaseId, option: strategy.option,
-        httpStatus, durationMs,
-        rawResponseFull: responseText.slice(0, 2000),
-        rawResponseLength: responseText.length,
-      });
-
-      let attemptParsed;
-      try {
-        attemptParsed = JSON.parse(responseText);
-      } catch (parseErr) {
-        log.error(`${tag} Failed to parse response as JSON`, parseErr, {
-          orgId, purchaseId, rawResponseSample: responseText.slice(0, 500),
-        });
-        attemptsLog.push({option: strategy.option, error: "parse-error"});
-        continue;
-      }
-
-      // CRITICAL: Nedarim's real TashlumBodedNew response uses "Result",
-      // not "Status" (confirmed live: {"Result":"Error","Message":"..."}) -
-      // normalize so success/failure detection works either way.
-      const resultStatus = attemptParsed.Result || attemptParsed.Status;
-
-      log.info(`${tag} Parsed response`, {
-        orgId, purchaseId, status: resultStatus,
-        message: attemptParsed.Message,
-        fullParsedResponse: attemptParsed,
-      });
-      attemptsLog.push({
-        option: strategy.option, status: resultStatus,
-        message: attemptParsed.Message, durationMs,
-      });
-
-      if (resultStatus === "OK") {
-        log.info(`${tag} SUCCEEDED - this is the working option`, {
-          orgId, purchaseId, durationMs,
-        });
-        parsed = attemptParsed;
-        optionUsed = strategy.option;
-        break;
-      }
-      if (isStructuralFailure(attemptParsed.Message)) {
-        log.warn(`${tag} Structural failure, trying next option`, {
-          orgId, purchaseId, message: attemptParsed.Message, durationMs,
-        });
-        continue;
-      }
-      log.warn(`${tag} Real decline - stopping, not trying more options`, {
-        orgId, purchaseId, message: attemptParsed.Message, durationMs,
-      });
-      parsed = attemptParsed;
-      optionUsed = strategy.option;
-      break;
-    }
-
-    log.info("chargeWithSavedCard: all attempts finished", {
-      orgId, purchaseId, optionUsed, attemptsSummary: attemptsLog,
-    });
-
-    if (!parsed) {
-      log.error("All saved-card charge options failed structurally", null, {
-        orgId, purchaseId, attempts: attemptsLog,
+    const attemptStart = Date.now();
+    let responseText;
+    let httpStatus = null;
+    try {
+      const nedarimResponse = await fetch(
+          `https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx?${new URLSearchParams(debitKevaParams)}`,
+          {method: "GET"},
+      );
+      httpStatus = nedarimResponse.status;
+      responseText = await nedarimResponse.text();
+    } catch (fetchErr) {
+      log.error("[SAVED-CARD DebitKeva] Network error", fetchErr, {
+        orgId, purchaseId, durationMs: Date.now() - attemptStart,
       });
       await purchaseRef.update({
-        status: "failed",
-        message: "כל אפשרויות החיוב נכשלו - ראה לוגים",
+        status: "failed", message: "שגיאת רשת מול נדרים",
         callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
         correlationId,
       });
       return callableOk(res, {
-        success: false, error: "לא ניתן לחייב את הכרטיס השמור",
-        correlationId, attempts: attemptsLog,
+        success: false, error: "שגיאת רשת מול נדרים", correlationId,
+      });
+    }
+    const durationMs = Date.now() - attemptStart;
+
+    log.info("[SAVED-CARD DebitKeva] Raw HTTP response from Nedarim", {
+      orgId, purchaseId, httpStatus, durationMs,
+      rawResponseFull: responseText.slice(0, 2000),
+    });
+
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch (parseErr) {
+      log.error("[SAVED-CARD DebitKeva] Failed to parse response as JSON", parseErr, {
+        orgId, purchaseId, rawResponseSample: responseText.slice(0, 500),
+      });
+      await purchaseRef.update({
+        status: "failed", message: "תגובה לא תקינה מנדרים",
+        callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
+        correlationId,
+      });
+      return callableOk(res, {
+        success: false, error: "תגובה לא תקינה מנדרים", correlationId,
       });
     }
 
-    const status = parsed.Result || parsed.Status;
-    const transactionId = parsed.Id || parsed.TransactionId || correlationId;
+    const status = parsed.Status || parsed.Result;
+    const transactionId = parsed.KevaId || correlationId;
+    log.info("[SAVED-CARD DebitKeva] Parsed response", {
+      orgId, purchaseId, status, message: parsed.Message,
+      kevaId: parsed.KevaId, nextDate: parsed.NextDate, lastNum: parsed.LastNum,
+      fullParsedResponse: parsed,
+    });
 
     if (status !== "OK") {
       await purchaseRef.update({
         status: "failed", message: parsed.Message || "",
         callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
-        correlationId, optionUsed,
+        correlationId,
       });
       return callableOk(res, {
         success: false, error: parsed.Message || "התשלום נכשל",
-        correlationId, optionUsed, attempts: attemptsLog,
+        correlationId,
       });
     }
 
@@ -633,15 +590,15 @@ app.post("/chargeWithSavedCard", async (req, res) => {
     atomicUpdate[`${purchasePath}/creditedUserId`] = callerUid;
     atomicUpdate[`${purchasePath}/creditedBy`] = "charge-with-saved-card-render";
     atomicUpdate[`${purchasePath}/correlationId`] = correlationId;
-    atomicUpdate[`${purchasePath}/optionUsed`] = optionUsed;
+    atomicUpdate[`${purchasePath}/nedarimKevaId`] = parsed.KevaId || null;
     await admin.database().ref().update(atomicUpdate);
 
     log.info("User credited successfully via saved card", {
-      orgId, callerUid, purchaseId, optionUsed,
+      orgId, callerUid, purchaseId, nedarimKevaId: parsed.KevaId,
     });
 
     return callableOk(res, {
-      success: true, message: "התשלום הצליח", correlationId, optionUsed,
+      success: true, message: "התשלום הצליח", correlationId,
     });
   } catch (error) {
     log.error("Error charging saved card", error, {correlationId});
@@ -945,11 +902,11 @@ app.post("/confirmPayment", async (req, res) => {
     }
     const callerUid = decodedToken.uid;
 
-    const {orgId, purchaseId, transactionId, lastFourDigits, tokenOnly} =
+    const {orgId, purchaseId, transactionId, lastFourDigits, tokenOnly, tokef} =
       (req.body && req.body.data) || {};
     log.info("confirmPayment: request received", {
       orgId, purchaseId, callerUid,
-      transactionId, lastFourDigits, tokenOnly,
+      transactionId, lastFourDigits, tokenOnly, tokefProvided: !!tokef,
       bodyKeys: Object.keys((req.body && req.body.data) || {}),
     });
     if (!orgId || !purchaseId) {
@@ -1014,6 +971,7 @@ app.post("/confirmPayment", async (req, res) => {
         savedCard: {
           kevaId: transactionId,
           savedAt: new Date().toISOString(),
+          ...(tokef ? {tokef: encryptData(tokef)} : {}),
         },
       });
       await purchaseRef.update({
