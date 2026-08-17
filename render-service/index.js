@@ -795,6 +795,25 @@ app.post("/debugChargeToken", async (req, res) => {
         },
         requiresTokef: true,
       },
+      // Testing whether DebitIframe=1 (a field that always comes back "0"
+      // in every response so far, despite us never sending it) triggers
+      // immediate processing instead of waiting for Nedarim's batch cycle -
+      // same winning recipe (ISO StartFrom) otherwise, just this one flag
+      // added.
+      debitkeva_iframe_flag: {
+        method: "GET",
+        url: "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitKeva.aspx",
+        params: {
+          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
+          Phone: "", CardNumber: kevaId, Tokef: tokef || "", Amount: amount,
+          Tashloumim: "1", Groupe: "", Avour: `SIONYX-debug-${uniqueSuffix}`, CVV: "",
+          Day: dayOfMonth, StartFrom: startFromIso, Zeout: "",
+          Currency: "1", MasofId: "Online", Token: kevaId,
+          ApiValid: apiPassword, CallBack: callbackUrl,
+          DebitIframe: "1",
+        },
+        requiresTokef: true,
+      },
     };
 
     const def = strategyDefs[strategy];
