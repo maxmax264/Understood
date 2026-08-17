@@ -199,8 +199,6 @@ app.post("/nedarimCallback", async (req, res) => {
 
     const paymentData = req.body || {};
     const {Amount, CreditCardNumber, Param1, Param2, Message} = paymentData;
-    const newCardToken = paymentData.KevaId || paymentData.Tokef ||
-      paymentData.Token || paymentData.TransactionToken || "";
     const TransactionId = paymentData.TransactionId;
     const Status = paymentData.Result || paymentData.Status;
 
@@ -285,12 +283,14 @@ app.post("/nedarimCallback", async (req, res) => {
           expiresAt.setDate(expiresAt.getDate() + validityDays);
           updatePayload.timeExpiresAt = expiresAt.toISOString();
         }
-        if (newCardToken) {
-          updatePayload.savedCard = {
-            kevaId: newCardToken,
-            savedAt: new Date().toISOString(),
-          };
-        }
+        // NOTE: previously overwrote user.savedCard here using KevaId/Token
+        // from the callback payload. Removed - now that this webhook fires
+        // for DebitKeva-triggered charges too, KevaId there is the
+        // one-time standing order's own ID, not the reusable card token,
+        // and this was silently corrupting savedCard.kevaId (and wiping
+        // the stored tokef) on every successful callback. Token/tokef
+        // persistence is handled exclusively by confirmPayment(tokenOnly)
+        // now (see PaymentDialog.HandleTokenCreatedAsync).
 
         const atomicUpdate = {};
         const userPath = `organizations/${orgId}/users/${purchase.userId}`;
@@ -475,6 +475,7 @@ app.post("/chargeWithSavedCard", async (req, res) => {
       Day: String(today.getDate()), StartFrom: startFromIso, Zeout: "",
       Currency: "1", MasofId: "Online", Token: kevaId,
       ApiValid: apiPassword, CallBack: callbackUrl,
+      Param1: purchaseId, Param2: orgId,
     };
 
     const maskedParams = {...debitKevaParams};
