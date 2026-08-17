@@ -199,8 +199,15 @@ app.post("/nedarimCallback", async (req, res) => {
 
     const paymentData = req.body || {};
     const {Amount, CreditCardNumber, Param1, Param2, Message} = paymentData;
-    const TransactionId = paymentData.TransactionId;
-    const Status = paymentData.Result || paymentData.Status;
+    // Two different callback shapes hit this same endpoint:
+    // - Ragil/CreateToken (iframe): includes explicit TransactionId + Status/Result.
+    // - DebitKeva (saved-card charge): no TransactionId or Status/Result field
+    //   at all - only KevaId. Nedarim only POSTs this notification when the
+    //   standing order was actually created/executed, so KevaId's presence
+    //   itself is the success signal for this shape.
+    const TransactionId = paymentData.TransactionId || paymentData.KevaId;
+    const Status = paymentData.Result || paymentData.Status ||
+      (paymentData.KevaId ? "OK" : undefined);
 
     const amountNum = Amount != null ? Number(Amount) : NaN;
     if (Number.isNaN(amountNum) || amountNum < 0) {
