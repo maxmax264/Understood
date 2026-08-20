@@ -55,6 +55,23 @@ admin.initializeApp({
 
 const app = express();
 app.use(express.json());
+
+// Every existing route here was only ever called from the WPF kiosk app
+// (not a browser), so CORS was never relevant. Now that /registerOrganization
+// is also called from sionyx-web (a real browser origin), the browser will
+// enforce CORS on every request to this server - handle it globally rather
+// than per-route. Allowing all origins is fine here: routes that need auth
+// already verify a Firebase ID token themselves: this only affects whether
+// a browser's JS is allowed to READ the response, not who can call the
+// endpoint at all (a non-browser client, or curl, was never restricted by
+// CORS in the first place).
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 app.use(express.urlencoded({extended: true}));
 
 // ═══════════════════════════════════════════════════════════════════
@@ -812,6 +829,143 @@ app.post("/confirmPayment", async (req, res) => {
   } catch (error) {
     log.error("Error confirming payment", error, {correlationId});
     return callableError(res, 500, "internal", error.message || "שגיאה באישור תשלום");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// POST /registerOrganization - moved here from Firebase Cloud
+// Functions (functions/index.js still has the original for reference/
+// rollback, but it's no longer called). Root cause of moving it: Gen2
+// Cloud Functions run on Cloud Run under the hood, which requires the
+// Firebase project to be on the Blaze (pay-as-you-go) plan - without
+// it, deploys fail outright AND already-deployed functions can stop
+// responding correctly (observed: CORS preflight failing with no
+// Access-Control-Allow-Origin header at all, meaning the request never
+// reached application code). User does not want to upgrade to Blaze,
+// so this endpoint runs on Render instead - same Admin SDK, same
+// logic, no Blaze dependency (matches why chargeWithSavedCard/
+// confirmPayment/nedarimCallback already live here instead of Cloud
+// Functions - Spark plan blocks outbound calls from Cloud Functions
+// entirely, a related but different Spark-plan limitation).
+// No auth check - this is the public "create a new org" signup flow,
+// same as it was as an onCall function (callable functions don't
+// require auth by default either; anyone can call registerOrganization
+// today).
+// ═══════════════════════════════════════════════════════════════════
+app.post("/registerOrganization", async (req, res) => {
+  const correlationId = generateCorrelationId();
+  const log = createLogger({correlationId, service: "organization-registration"});
+
+  const body = (req.body && req.body.data) || req.body || {};
+  log.info("Organization registration request received", {
+    hasData: !!body, dataKeys: Object.keys(body || {}),
+  });
+
+  try {
+    const {
+      organizationName, nedarimMosadId, nedarimApiValid,
+      adminPhone, adminPassword, adminFirstName, adminLastName, adminEmail,
+    } = body;
+
+    // Nedarim credentials are optional at registration and can be
+    // configured later from the dashboard settings screen.
+    if (!organizationName || !adminPhone || !adminPassword ||
+        !adminFirstName || !adminLastName) {
+      return callableError(res, 400, "invalid-argument", "חסרים שדות חובה");
+    }
+
+    const cleanOrgName = organizationName.trim();
+    const cleanMosadId = (nedarimMosadId || "").trim();
+    const cleanApiValid = (nedarimApiValid || "").trim();
+    const billingConfigured = !!(cleanMosadId && cleanApiValid);
+    const cleanAdminPhone = adminPhone.replace(/\D/g, "");
+
+    log.info("Processing registration", {
+      orgNameLength: cleanOrgName.length, hasAdminPhone: !!cleanAdminPhone,
+    });
+
+    const orgId = cleanOrgName.toLowerCase()
+        .replace(/[^a-z0-9\u0590-\u05FF]/g, "")
+        .replace(/\s+/g, "");
+
+    if (!orgId || orgId.length < 2) {
+      return callableError(res, 400, "invalid-argument",
+          "Organization name must contain valid characters");
+    }
+
+    const orgsRef = admin.database().ref("organizations");
+    const orgsSnapshot = await orgsRef.once("value");
+    if (orgsSnapshot.exists()) {
+      const organizations = orgsSnapshot.val();
+      if (organizations[orgId]) {
+        log.warn("Organization ID already exists", {orgId, orgName: cleanOrgName});
+        return callableError(res, 409, "already-exists", "Organization name already exists");
+      }
+    }
+    log.info("Organization ID generated from name", {orgId, orgName: cleanOrgName});
+
+    const phoneToEmail = (phone) => `${phone.replace(/\D/g, "")}@sionyx.app`;
+    const adminFirebaseEmail = phoneToEmail(cleanAdminPhone);
+    log.info("Creating admin user in Firebase Auth", {email: adminFirebaseEmail, phone: cleanAdminPhone});
+
+    let adminUid;
+    try {
+      const userRecord = await admin.auth().createUser({
+        email: adminFirebaseEmail,
+        password: adminPassword,
+        displayName: `${adminFirstName} ${adminLastName}`,
+      });
+      adminUid = userRecord.uid;
+      log.info("Admin user created in Firebase Auth", {uid: adminUid});
+    } catch (authError) {
+      log.error("Failed to create admin user in Firebase Auth", authError);
+      if (authError.code === "auth/email-already-exists") {
+        return callableError(res, 409, "already-exists", "מספר הטלפון כבר רשום במערכת");
+      }
+      return callableError(res, 500, "internal", "Failed to create admin user: " + authError.message);
+    }
+
+    const metadata = {
+      name: cleanOrgName,
+      nedarim_mosad_id: encryptData(cleanMosadId),
+      nedarim_api_valid: encryptData(cleanApiValid),
+      billing_configured: billingConfigured,
+      created_at: new Date().toISOString(),
+      status: "active",
+      created_by: "public-registration",
+      admin_uid: adminUid,
+      admin_phone: cleanAdminPhone,
+      admin_email: adminEmail ? adminEmail.trim() : "",
+      correlation_id: correlationId,
+    };
+    await admin.database().ref(`organizations/${orgId}/metadata`).set(metadata);
+    log.info("Organization metadata saved", {orgId, orgName: cleanOrgName});
+
+    const adminUserData = {
+      firstName: adminFirstName.trim(),
+      lastName: adminLastName.trim(),
+      phoneNumber: cleanAdminPhone,
+      email: adminEmail ? adminEmail.trim() : "",
+      remainingTime: 0,
+      printBalance: 0.0,
+      isSessionActive: false,
+      isAdmin: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdBy: "organization-registration",
+      correlation_id: correlationId,
+    };
+    await admin.database().ref(`organizations/${orgId}/users/${adminUid}`).set(adminUserData);
+    log.info("Admin user data saved to organization", {orgId, adminUid, isAdmin: true});
+
+    return callableOk(res, {
+      success: true, orgId, adminUid,
+      message: "Organization and admin user registered successfully",
+      correlationId,
+    });
+  } catch (error) {
+    log.error("Error registering organization", error, {errorPhase: "organization-registration"});
+    return callableError(res, 500, "internal", "Failed to register organization: " + error.message);
   }
 });
 
