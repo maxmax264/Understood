@@ -30,6 +30,7 @@
 const express = require("express");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
 
 // This server's own public URL, used to build the CallBack= param sent to
 // Nedarim on the saved-card recurring charge (TashlumBodedNew) - per the
@@ -60,19 +61,47 @@ app.use(express.json());
 // (not a browser), so CORS was never relevant. Now that /registerOrganization
 // is also called from sionyx-web (a real browser origin), the browser will
 // enforce CORS on every request to this server - handle it globally rather
-// than per-route. Allowing all origins is fine here: routes that need auth
-// already verify a Firebase ID token themselves: this only affects whether
-// a browser's JS is allowed to READ the response, not who can call the
-// endpoint at all (a non-browser client, or curl, was never restricted by
+// than per-route. Routes that need auth already verify a Firebase ID token
+// themselves, so a wildcard origin was never a way to bypass auth - but it
+// did let ANY website's JS read responses from unauthenticated routes like
+// /registerOrganization. Restricting to our own Hosting domains closes that
+// off without affecting the kiosk (a non-browser client is never subject to
 // CORS in the first place).
+const ALLOWED_ORIGINS = [
+  "https://sionyx-19636.web.app",
+  "https://sionyx-19636.firebaseapp.com",
+];
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 app.use(express.urlencoded({extended: true}));
+
+// General rate limiting across the whole service - a floor against abuse
+// on every route, on top of any per-route limiter below.
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {error: "יותר מדי בקשות, נסה שוב מאוחר יותר"},
+});
+app.use(generalLimiter);
+
+// Stricter limit for the public, unauthenticated signup endpoint.
+const registrationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {error: "יותר מדי ניסיונות הרשמה, נסה שוב מאוחר יותר"},
+});
 
 // ═══════════════════════════════════════════════════════════════════
 // DIAGNOSTIC: log absolutely every incoming request, to ANY path, no
@@ -1115,7 +1144,7 @@ app.post("/confirmPayment", async (req, res) => {
 // require auth by default either; anyone can call registerOrganization
 // today).
 // ═══════════════════════════════════════════════════════════════════
-app.post("/registerOrganization", async (req, res) => {
+app.post("/registerOrganization", registrationLimiter, async (req, res) => {
   const correlationId = generateCorrelationId();
   const log = createLogger({correlationId, service: "organization-registration"});
 
@@ -1123,6 +1152,14 @@ app.post("/registerOrganization", async (req, res) => {
   log.info("Organization registration request received", {
     hasData: !!body, dataKeys: Object.keys(body || {}),
   });
+
+  // Honeypot: a hidden form field named "website" that a real user never
+  // sees or fills, but that naive bots (which fill every input) do. Not a
+  // security boundary by itself - paired with the rate limiter above.
+  if (body.website) {
+    log.info("Registration rejected - honeypot field filled (bot)");
+    return callableError(res, 400, "invalid-argument", "בקשה לא תקינה");
+  }
 
   try {
     const {
