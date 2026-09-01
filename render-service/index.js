@@ -1269,6 +1269,89 @@ app.post("/registerOrganization", registrationLimiter, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// POST /resetUserPassword - moved here from Firebase Cloud Functions
+// (functions/index.js still has the original for reference/rollback,
+// but it's no longer called). Same Blaze-plan reasoning as
+// /registerOrganization above: Gen2 Cloud Functions require Blaze to
+// deploy at all, so this runs on Render instead with the same Admin
+// SDK and the same authorization logic (caller must be an
+// authenticated admin of the target organization).
+// Body: {"data": {orgId, userId, newPassword}}, matching the Firebase
+// callable wire protocol so the web dashboard needs only to change
+// which URL it calls, not how it builds the request.
+// ═══════════════════════════════════════════════════════════════════
+const toFirebasePassword = (raw) => (raw.length >= 6 ? raw : `px_${raw}`);
+
+app.post("/resetUserPassword", async (req, res) => {
+  const correlationId = generateCorrelationId();
+  const log = createLogger({correlationId, service: "reset-user-password"});
+
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ?
+      authHeader.slice(7) : null;
+    if (!idToken) {
+      log.warn("resetUserPassword: no Authorization header");
+      return callableError(res, 401, "unauthenticated", "Must be authenticated to reset passwords");
+    }
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(idToken);
+    } catch (authErr) {
+      log.warn("ID token verification failed", {error: authErr.message});
+      return callableError(res, 401, "unauthenticated", "Invalid token");
+    }
+    const callerUid = decodedToken.uid;
+
+    const {orgId, userId, newPassword} = (req.body && req.body.data) || {};
+    log.info("Password reset request received", {orgId, userId, callerUid});
+
+    if (!orgId || !userId || !newPassword) {
+      return callableError(res, 400, "invalid-argument",
+          "Missing required fields: orgId, userId, newPassword");
+    }
+    if (newPassword.length < 4) {
+      return callableError(res, 400, "invalid-argument", "הסיסמה חייבת להכיל לפחות 4 תווים");
+    }
+
+    const callerRef = admin.database().ref(`organizations/${orgId}/users/${callerUid}`);
+    const callerSnapshot = await callerRef.once("value");
+    if (!callerSnapshot.exists()) {
+      log.warn("Caller not found in organization", {callerUid, orgId});
+      return callableError(res, 403, "permission-denied", "You are not a member of this organization");
+    }
+    const callerData = callerSnapshot.val();
+    if (!callerData.isAdmin) {
+      log.warn("Caller is not an admin", {callerUid, orgId});
+      return callableError(res, 403, "permission-denied", "רק מנהלים יכולים לאפס סיסמאות");
+    }
+
+    const targetUserRef = admin.database().ref(`organizations/${orgId}/users/${userId}`);
+    const targetUserSnapshot = await targetUserRef.once("value");
+    if (!targetUserSnapshot.exists()) {
+      log.warn("Target user not found", {userId, orgId});
+      return callableError(res, 404, "not-found", "המשתמש לא נמצא");
+    }
+
+    await admin.auth().updateUser(userId, {password: toFirebasePassword(newPassword)});
+    await targetUserRef.update({
+      passwordResetAt: new Date().toISOString(),
+      passwordResetBy: callerUid,
+      updatedAt: new Date().toISOString(),
+    });
+
+    log.info("Password reset successful", {targetUserId: userId, callerUid, correlationId});
+    return callableOk(res, {success: true, message: "הסיסמה אופסה בהצלחה", correlationId});
+  } catch (error) {
+    log.error("Error resetting password", error, {correlationId});
+    if (error.code === "auth/user-not-found") {
+      return callableError(res, 404, "not-found", "המשתמש לא נמצא במערכת האימות");
+    }
+    return callableError(res, 500, "internal", "שגיאה באיפוס הסיסמה: " + error.message);
+  }
+});
+
 app.get("/", (req, res) => res.status(200).send("SIONYX payment bridge is up"));
 
 const PORT = process.env.PORT || 3000;
