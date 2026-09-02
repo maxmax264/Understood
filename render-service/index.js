@@ -1,4 +1,4 @@
-/**
+﻿/**
  * SIONYX payment bridge — runs on Render (or any Node host) instead of
  * Firebase Cloud Functions, because Cloud Functions gen2 (and any function
  * that makes outbound network calls) requires the Firebase Blaze plan to
@@ -1254,6 +1254,7 @@ app.post("/registerOrganization", registrationLimiter, async (req, res) => {
       updatedAt: new Date().toISOString(),
       createdBy: "organization-registration",
       correlation_id: correlationId,
+      passwordEncrypted: encryptData(adminPassword),
     };
     await admin.database().ref(`organizations/${orgId}/users/${adminUid}`).set(adminUserData);
     log.info("Admin user data saved to organization", {orgId, adminUid, isAdmin: true});
@@ -1339,6 +1340,7 @@ app.post("/resetUserPassword", async (req, res) => {
       passwordResetAt: new Date().toISOString(),
       passwordResetBy: callerUid,
       updatedAt: new Date().toISOString(),
+      passwordEncrypted: encryptData(newPassword),
     });
 
     log.info("Password reset successful", {targetUserId: userId, callerUid, correlationId});
@@ -1353,6 +1355,38 @@ app.post("/resetUserPassword", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.status(200).send("SIONYX payment bridge is up"));
+
+app.post("/getOrgUserPassword", async (req, res) => {
+  const correlationId = generateCorrelationId();
+  const log = createLogger({correlationId, service: "get-org-user-password"});
+  try {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return callableError(res, 401, "unauthenticated", "Must be authenticated");
+    let decodedToken;
+    try { decodedToken = await admin.auth().verifyIdToken(idToken); }
+    catch (authErr) { return callableError(res, 401, "unauthenticated", "Invalid token"); }
+    const callerUid = decodedToken.uid;
+    const {orgId, userId} = (req.body && req.body.data) || {};
+    if (!orgId || !userId) return callableError(res, 400, "invalid-argument", "Missing required fields: orgId, userId");
+    const ownerSnapshot = await admin.database().ref(`owners/${callerUid}`).once("value");
+    if (!ownerSnapshot.exists()) return callableError(res, 403, "permission-denied", "רק בעלי מערכת יכולים לצפות בפרטי התחברות");
+    const userSnapshot = await admin.database().ref(`organizations/${orgId}/users/${userId}`).once("value");
+    if (!userSnapshot.exists()) return callableError(res, 404, "not-found", "המשתמש לא נמצא");
+    const userData = userSnapshot.val();
+    if (!userData.passwordEncrypted) {
+      return callableOk(res, {success: true, available: false, phone: userData.phoneNumber || "", message: "אין סיסמה שמורה למשתמש זה"});
+    }
+    let password;
+    try { password = decryptData(userData.passwordEncrypted); }
+    catch (e) { log.error("Failed to decrypt stored password", e, {orgId, userId}); return callableError(res, 500, "internal", "שגיאה בפענוח הסיסמה"); }
+    log.info("Owner viewed org user password", {callerUid, orgId, userId, correlationId});
+    return callableOk(res, {success: true, available: true, phone: userData.phoneNumber || "", password});
+  } catch (error) {
+    log.error("Error getting org user password", error, {correlationId});
+    return callableError(res, 500, "internal", "שגיאה בקבלת הסיסמה: " + error.message);
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
