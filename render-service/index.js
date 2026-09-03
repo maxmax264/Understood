@@ -70,6 +70,8 @@ app.use(express.json());
 const ALLOWED_ORIGINS = [
   "https://sionyx-19636.web.app",
   "https://sionyx-19636.firebaseapp.com",
+  "https://pc-sion.web.app",
+  "https://pc-sion.firebaseapp.com",
 ];
 app.use((req, res, next) => {
   const origin = req.headers.origin;
