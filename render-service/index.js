@@ -370,6 +370,156 @@ app.post("/nedarimCallback", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
+// chargeViaDebitCard - shared helper for the "regular" (non-Keva)
+// payment-method branch of /chargeWithSavedCard below. Mirrors the
+// already-tested /chargeWithSavedCardRegular endpoint's DebitCard.aspx
+// logic exactly (same params, same official-doc field names, same
+// credit-on-success shape), but as a standalone function so it can be
+// called from inside /chargeWithSavedCard without touching a single
+// line of the existing DebitKeva code path there. Deliberately NOT
+// shared/refactored with /chargeWithSavedCardRegular itself, to avoid
+// any risk of changing that endpoint's already-verified behavior.
+// ═══════════════════════════════════════════════════════════════════
+async function chargeViaDebitCard({
+  res, log, correlationId, orgId, purchaseId, callerUid,
+  purchase, user, purchaseRef, mosadId, apiPassword, kevaId, tokef,
+}) {
+  const amount = Number(purchase.amount) || 0;
+  const debitCardUrl = "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx";
+  const avour = `Purchase-${purchaseId}-${correlationId.slice(-8)}`;
+  const userPhone = user.phoneNumber || "";
+  const userFirstName = user.firstName || "";
+  const userLastName = user.lastName || "";
+
+  const debitCardParams = {
+    Mosad: mosadId,
+    ApiValid: apiPassword,
+    Token: kevaId,
+    Tokef: tokef,
+    Amount: amount.toFixed(0),
+    Tashloumim: "1",
+    Currency: "1",
+    ClientName: userFirstName && userLastName ? `${userFirstName} ${userLastName}` : (userFirstName || ""),
+    Adresse: "",
+    Mail: "",
+    Phone: userPhone || "",
+    Zeout: "",
+    Groupe: "",
+    Avour: avour,
+  };
+
+  const maskedParams = {...debitCardParams};
+  maskedParams.ApiValid = `${String(apiPassword).slice(0, 2)}***`;
+  maskedParams.Token = `${String(kevaId).slice(0, 3)}***`;
+  log.info("[REGULAR-CHARGE DebitCard via chargeWithSavedCard] Sending", {
+    orgId, purchaseId, correlationId, url: debitCardUrl, paramsSent: maskedParams,
+  });
+
+  let responseText;
+  let httpStatus = null;
+  const attemptStart = Date.now();
+  try {
+    const nedarimResponse = await fetch(
+        `${debitCardUrl}?${new URLSearchParams(debitCardParams)}`,
+        {method: "GET"},
+    );
+    httpStatus = nedarimResponse.status;
+    responseText = await nedarimResponse.text();
+  } catch (fetchErr) {
+    log.error("[REGULAR-CHARGE DebitCard via chargeWithSavedCard] Network error", fetchErr, {
+      orgId, purchaseId, durationMs: Date.now() - attemptStart,
+    });
+    await purchaseRef.update({
+      status: "failed", message: "שגיאת רשת מול נדרים",
+      callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
+      correlationId,
+    });
+    return callableOk(res, {success: false, error: "שגיאת רשת מול נדרים", correlationId});
+  }
+  const durationMs = Date.now() - attemptStart;
+  log.info("[REGULAR-CHARGE DebitCard via chargeWithSavedCard] Raw response", {
+    orgId, purchaseId, httpStatus, durationMs, rawResponseFull: responseText.slice(0, 2000),
+  });
+
+  let parsed;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch (parseErr) {
+    log.error("[REGULAR-CHARGE DebitCard via chargeWithSavedCard] Failed to parse JSON", parseErr, {
+      orgId, purchaseId, rawResponseSample: responseText.slice(0, 500),
+    });
+    await purchaseRef.update({
+      status: "failed", message: "תגובה לא תקינה מנדרים",
+      callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
+      correlationId,
+    });
+    return callableOk(res, {success: false, error: "תגובה לא תקינה מנדרים", correlationId});
+  }
+
+  const status = parsed.Status || parsed.Result;
+  log.info("[REGULAR-CHARGE DebitCard via chargeWithSavedCard] Parsed response", {
+    orgId, purchaseId, status, message: parsed.Message, fullParsedResponse: parsed,
+  });
+
+  if (status !== "OK") {
+    await purchaseRef.update({
+      status: "failed", message: parsed.Message || "כשל בחיוב הרגיל (DebitCard.aspx)",
+      callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
+      correlationId,
+    });
+    return callableOk(res, {
+      success: false, error: parsed.Message || "התשלום נכשל", correlationId,
+    });
+  }
+
+  const transactionId = parsed.TransactionId || parsed.Confirmation || correlationId;
+  const currentTime = user.remainingTime || 0;
+  const currentPrintBudget = user.printBalance || 0;
+  const addingMinutes = purchase.minutes || 0;
+  const addingPrintBudget = purchase.printBudget || 0;
+  const validityDays = purchase.validityDays || 0;
+  const newTime = currentTime + (addingMinutes * 60);
+  const newPrintBudget = currentPrintBudget + addingPrintBudget;
+
+  const updatePayload = {
+    remainingTime: newTime,
+    printBalance: newPrintBudget,
+    updatedAt: new Date().toISOString(),
+    lastCreditedAt: new Date().toISOString(),
+    lastCreditedBy: "charge-with-saved-card-regular-render",
+    correlationId,
+  };
+  if (validityDays > 0) {
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + validityDays);
+    updatePayload.timeExpiresAt = expiresAt.toISOString();
+  }
+
+  const atomicUpdate = {};
+  const userPath = `organizations/${orgId}/users/${callerUid}`;
+  for (const [key, val] of Object.entries(updatePayload)) {
+    atomicUpdate[`${userPath}/${key}`] = val;
+  }
+  const purchasePath = `organizations/${orgId}/purchases/${purchaseId}`;
+  atomicUpdate[`${purchasePath}/status`] = "completed";
+  atomicUpdate[`${purchasePath}/transactionId`] = transactionId;
+  atomicUpdate[`${purchasePath}/amount`] = amount;
+  atomicUpdate[`${purchasePath}/creditedAt`] = new Date().toISOString();
+  atomicUpdate[`${purchasePath}/creditedUserId`] = callerUid;
+  atomicUpdate[`${purchasePath}/creditedBy`] = "charge-with-saved-card-regular-render";
+  atomicUpdate[`${purchasePath}/correlationId`] = correlationId;
+  await admin.database().ref().update(atomicUpdate);
+
+  log.info("User credited successfully via REGULAR (DebitCard, non-Keva) charge, dispatched from chargeWithSavedCard", {
+    orgId, callerUid, purchaseId, transactionId,
+  });
+
+  return callableOk(res, {
+    success: true, message: "התשלום הצליח (חיוב רגיל, לא הוראת קבע)", correlationId,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // POST /chargeWithSavedCard - REST equivalent of the onCall function.
 // Body: {"data": {orgId, purchaseId, kevaId}}, matching the Firebase
 // callable wire protocol so the existing WPF client code needs no
@@ -494,6 +644,22 @@ app.post("/chargeWithSavedCard", async (req, res) => {
       log.error("chargeWithSavedCard: missing Nedarim credentials after lookup",
           null, {orgId});
       return callableError(res, 412, "failed-precondition", "חסרים פרטי התחברות לנדרים");
+    }
+
+    // ── Org-level payment-method switch (metadata/settings/payment/
+    // paymentMethod). Defaults to "keva" whenever the field is missing or
+    // unrecognized, so every existing org is completely unaffected unless
+    // someone explicitly opts in to "regular" from the dashboard settings.
+    // This is an early return - the DebitKeva code below it is never
+    // reached (and not modified at all) when paymentMethod is "regular".
+    const paymentMethod = (meta.settings && meta.settings.payment &&
+      meta.settings.payment.paymentMethod === "regular") ? "regular" : "keva";
+    log.info("chargeWithSavedCard: resolved paymentMethod setting", {orgId, paymentMethod});
+    if (paymentMethod === "regular") {
+      return await chargeViaDebitCard({
+        res, log, correlationId, orgId, purchaseId, callerUid,
+        purchase, user, purchaseRef, mosadId, apiPassword, kevaId, tokef,
+      });
     }
 
     const amount = Number(purchase.amount) || 0;
@@ -671,31 +837,29 @@ function tryDecrypt(value) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// EXPERIMENTAL — POST /chargeWithSavedCardRegular
+// POST /chargeWithSavedCardRegular
 //
-// חשוב: זו לא הוראת קבע! זו קריאה ל-DebitCard.aspx, שהוא ה-endpoint
-// של נדרים פלוס לחיוב רגיל/חד-פעמי (או תשלומים, אבל בלי ליצור אובייקט
-// "הוראת קבע" נמשך). זה שונה מ-DebitKeva.aspx (המשמש כרגע ב-
-// /chargeWithSavedCard למעלה) שיוצר בפועל הוראת קבע ב-Tashloumim=1
-// שרק "רצה" באותה דקה - עובד, אבל מבחינה טכנית זו עדיין הוראת קבע.
+// חשוב: זו לא הוראת קבע! זו קריאה ל-DebitCard.aspx, ה-endpoint הרשמי
+// של נדרים פלוס לחיוב חד-פעמי בכרטיס אשראי בטוקן קיים (לפי המסמך
+// הרשמי שנשלח ע"י תמיכת נדרים פלוס, DebitToken.pdf). שונה לגמרי
+// מ-DebitKeva.aspx (המשמש ב-/chargeWithSavedCard למעלה) שיוצר בפועל
+// אובייקט "הוראת קבע" עם Tashloumim=1 שרק "רץ" באותה דקה.
 //
-// DebitCard.aspx לא מקבל StartFrom/Day/Month בכלל (אלה פרמטרים
-// ספציפיים ל-DebitKeva) - זה עוד סימן שזה מודול שונה לגמרי, לא עוד
-// אופציה של אותו מודול.
+// לפי המסמך הרשמי, הפרמטרים של DebitCard.aspx הם (שמות מדויקים):
+//   Mosad (לא MosadId!), ApiValid, Token, Tokef, CVV (אופציונלי),
+//   Amount, Tashloumim, Currency (אופציונלי), ClientName, Adresse,
+//   Mail, Phone, Zeout, Groupe, Avour (כולם אופציונליים חוץ מהמצוין).
+// אין CardNumber, ClientId, MasofId, CallBack, Param1, Param2 -
+// אלה שדות של DebitKeva/מודולים אחרים ולא קיימים במסמך הרשמי של
+// endpoint זה. אין גם callback אסינכרוני מתועד - התגובה מתקבלת ישירות
+// ב-HTTP response (עסקה סינכרונית), בדיוק כמו שהקוד כאן כבר בודק.
 //
-// לפי דוגמאות API ציבוריות של נדרים פלוס (לא מתועד רשמית, נאסף
-// מפורומים), הפרמטרים של DebitCard.aspx:
-//   MosadId, ClientName, Adresse, Phone, ClientId, CardNumber, Tokef,
-//   Amount, Tashloumim, Groupe, Avour, Token, CVV, Zeout, Currency,
-//   MasofId, ApiValid, CallBack, Param1, Param2
-// כשמחייבים כרטיס שמור (טוקן) ולא כרטיס גולמי: CardNumber ריק, CVV
-// ריק, והטוקן השמור הולך בשדה Token. זה ההבדל המרכזי מהניסיון שכבר
-// עובד עם DebitKeva, ששם קידדנו את kevaId גם ב-CardNumber וגם ב-
-// Token (כי לא היה ברור אז מה הפורמט הנכון).
-//
-// לא ידוע איזו מהאסטרטגיות הבאות (אם בכלל) תעבוד מול נדרים - זה בדיוק
-// למה יש כמה ניסיונות ברצף, כל אחד עם השדות ששונים, ולוגים מלאים על
-// כל ניסיון בנפרד כדי שאפשר יהיה להשוות תגובות.
+// אזהרה מפורשת מהמסמך הרשמי: שימוש ב-endpoint זה עם כל דבר שאינו
+// טוקן אמיתי ששמור מראש בנדרים פלוס (למשל מספר כרטיס גולמי) גורם
+// לחסימה מיידית של המוסד, בלי התראה מוקדמת. ה-Token שאנחנו שולחים
+// כאן (kevaId מה-DB) הגיע במקור מתגובת CreateToken האמיתית של נדרים
+// (ראה HandleTokenCreatedAsync בקיוסק) - לא מומצא - כך שזה תואם את
+// השימוש המותר. בכל זאת: קריאה אחת בדיוק לפי המסמך, בלי ניחושים.
 // ═══════════════════════════════════════════════════════════════════
 app.post("/chargeWithSavedCardRegular", async (req, res) => {
   const correlationId = generateCorrelationId();
@@ -774,158 +938,141 @@ app.post("/chargeWithSavedCardRegular", async (req, res) => {
     }
 
     const amount = Number(purchase.amount) || 0;
-    const callbackUrl = `${PUBLIC_BASE_URL}/nedarimCallback`;
     const debitCardUrl = "https://matara.pro/nedarimplus/V6/Files/WebServices/DebitCard.aspx";
+    const avour = `Purchase-${purchaseId}-${correlationId.slice(-8)}`;
+    const userPhone = user.phoneNumber || "";
+    const userFirstName = user.firstName || "";
+    const userLastName = user.lastName || "";
 
-    // כל אובייקט כאן הוא ניסיון נפרד - נרוץ עליהם בסדר, ונעצור בראשון
-    // שמחזיר Status:OK. ה-label נכנס ללוגים כדי לדעת בדיעבד איזו
-    // וריאציה בדיוק עבדה (אם עבדה).
-    const attempts = [
-      {
-        label: "DebitCard.aspx - Token field only (no CardNumber/CVV) - חיוב רגיל",
-        params: {
-          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
-          Phone: "", ClientId: "", CardNumber: "", Tokef: tokef,
-          Amount: amount.toFixed(0), Tashloumim: "1", Groupe: "",
-          Avour: `Purchase-${purchaseId}-${correlationId.slice(-8)}`,
-          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
-          MasofId: "Online", ApiValid: apiPassword, CallBack: callbackUrl,
-          Param1: purchaseId, Param2: orgId,
-        },
-      },
-      {
-        label: "DebitCard.aspx - CardNumber+Token both = kevaId (מראה של DebitKeva שעובד)",
-        params: {
-          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
-          Phone: "", ClientId: "", CardNumber: kevaId, Tokef: tokef,
-          Amount: amount.toFixed(0), Tashloumim: "1", Groupe: "",
-          Avour: `Purchase-${purchaseId}-${correlationId.slice(-8)}-b`,
-          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
-          MasofId: "Online", ApiValid: apiPassword, CallBack: callbackUrl,
-          Param1: purchaseId, Param2: orgId,
-        },
-      },
-      {
-        label: "DebitCard.aspx - Tashloumim ריק (null=חד פעמי לפי אחת הדוגמאות בפורום)",
-        params: {
-          MosadId: mosadId, ClientName: "", Adresse: "", Mail: "",
-          Phone: "", ClientId: "", CardNumber: "", Tokef: tokef,
-          Amount: amount.toFixed(0), Tashloumim: "", Groupe: "",
-          Avour: `Purchase-${purchaseId}-${correlationId.slice(-8)}-c`,
-          Token: kevaId, CVV: "", Zeout: "", Currency: "1",
-          MasofId: "Online", ApiValid: apiPassword, CallBack: callbackUrl,
-          Param1: purchaseId, Param2: orgId,
-        },
-      },
-    ];
+    // שדות מדויקים לפי המסמך הרשמי (DebitToken.pdf) - קריאה אחת, בלי
+    // ניחושים. userPhone/userFirstName/userLastName/userZeout מגיעים
+    // מהלקוח (אופציונלי - חלק מהשדות עשויים להיות חובה בהתאם להגדרות
+    // המוסד בנדרים פלוס, ראה הערת "מתקדם" במסמך).
+    const debitCardParams = {
+      Mosad: mosadId,
+      ApiValid: apiPassword,
+      Token: kevaId,
+      Tokef: tokef,
+      Amount: amount.toFixed(0),
+      Tashloumim: "1",
+      Currency: "1",
+      ClientName: userFirstName && userLastName ? `${userFirstName} ${userLastName}` : (userFirstName || ""),
+      Adresse: "",
+      Mail: "",
+      Phone: userPhone || "",
+      Zeout: "",
+      Groupe: "",
+      Avour: avour,
+    };
 
-    for (const attempt of attempts) {
-      const maskedParams = {...attempt.params};
-      maskedParams.ApiValid = `${String(apiPassword).slice(0, 2)}***`;
-      maskedParams.Token = attempt.params.Token ? `${String(attempt.params.Token).slice(0, 3)}***` : "";
-      maskedParams.CardNumber = attempt.params.CardNumber ? `${String(attempt.params.CardNumber).slice(0, 3)}***` : "";
-      log.info(`[REGULAR-CHARGE] Trying: ${attempt.label}`, {
-        orgId, purchaseId, correlationId, url: debitCardUrl, paramsSent: maskedParams,
+    const maskedParams = {...debitCardParams};
+    maskedParams.ApiValid = `${String(apiPassword).slice(0, 2)}***`;
+    maskedParams.Token = `${String(kevaId).slice(0, 3)}***`;
+    log.info("[REGULAR-CHARGE DebitCard] Sending", {
+      orgId, purchaseId, correlationId, url: debitCardUrl, paramsSent: maskedParams,
+    });
+
+    let responseText;
+    let httpStatus = null;
+    const attemptStart = Date.now();
+    try {
+      const nedarimResponse = await fetch(
+          `${debitCardUrl}?${new URLSearchParams(debitCardParams)}`,
+          {method: "GET"},
+      );
+      httpStatus = nedarimResponse.status;
+      responseText = await nedarimResponse.text();
+    } catch (fetchErr) {
+      log.error("[REGULAR-CHARGE DebitCard] Network error", fetchErr, {
+        orgId, purchaseId, durationMs: Date.now() - attemptStart,
       });
-
-      let responseText;
-      let httpStatus = null;
-      const attemptStart = Date.now();
-      try {
-        const nedarimResponse = await fetch(
-            `${debitCardUrl}?${new URLSearchParams(attempt.params)}`,
-            {method: "GET"},
-        );
-        httpStatus = nedarimResponse.status;
-        responseText = await nedarimResponse.text();
-      } catch (fetchErr) {
-        log.error(`[REGULAR-CHARGE] Network error on: ${attempt.label}`, fetchErr, {
-          orgId, purchaseId, durationMs: Date.now() - attemptStart,
-        });
-        continue; // move to next attempt
-      }
-      const durationMs = Date.now() - attemptStart;
-      log.info(`[REGULAR-CHARGE] Raw response for: ${attempt.label}`, {
-        orgId, purchaseId, httpStatus, durationMs, rawResponseFull: responseText.slice(0, 2000),
+      await purchaseRef.update({
+        status: "failed", message: "שגיאת רשת מול נדרים",
+        callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
+        correlationId,
       });
+      return callableOk(res, {success: false, error: "שגיאת רשת מול נדרים", correlationId});
+    }
+    const durationMs = Date.now() - attemptStart;
+    log.info("[REGULAR-CHARGE DebitCard] Raw response", {
+      orgId, purchaseId, httpStatus, durationMs, rawResponseFull: responseText.slice(0, 2000),
+    });
 
-      let parsed;
-      try {
-        parsed = JSON.parse(responseText);
-      } catch (parseErr) {
-        log.error(`[REGULAR-CHARGE] Failed to parse JSON for: ${attempt.label}`, parseErr, {
-          orgId, purchaseId, rawResponseSample: responseText.slice(0, 500),
-        });
-        continue;
-      }
-
-      const status = parsed.Status || parsed.Result;
-      log.info(`[REGULAR-CHARGE] Parsed response for: ${attempt.label}`, {
-        orgId, purchaseId, status, message: parsed.Message, fullParsedResponse: parsed,
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch (parseErr) {
+      log.error("[REGULAR-CHARGE DebitCard] Failed to parse JSON", parseErr, {
+        orgId, purchaseId, rawResponseSample: responseText.slice(0, 500),
       });
-
-      if (status === "OK") {
-        // מצאנו וריאציה שעובדת - זוכים את המשתמש בדיוק כמו בנתיב הרגיל.
-        const transactionId = parsed.KevaId || parsed.TransactionId || correlationId;
-        const currentTime = user.remainingTime || 0;
-        const currentPrintBudget = user.printBalance || 0;
-        const addingMinutes = purchase.minutes || 0;
-        const addingPrintBudget = purchase.printBudget || 0;
-        const validityDays = purchase.validityDays || 0;
-        const newTime = currentTime + (addingMinutes * 60);
-        const newPrintBudget = currentPrintBudget + addingPrintBudget;
-
-        const updatePayload = {
-          remainingTime: newTime,
-          printBalance: newPrintBudget,
-          updatedAt: new Date().toISOString(),
-          lastCreditedAt: new Date().toISOString(),
-          lastCreditedBy: `charge-with-saved-card-regular-render:${attempt.label}`,
-          correlationId,
-        };
-        if (validityDays > 0) {
-          const expiresAt = new Date();
-          expiresAt.setDate(expiresAt.getDate() + validityDays);
-          updatePayload.timeExpiresAt = expiresAt.toISOString();
-        }
-
-        const atomicUpdate = {};
-        const userPath = `organizations/${orgId}/users/${callerUid}`;
-        for (const [key, val] of Object.entries(updatePayload)) {
-          atomicUpdate[`${userPath}/${key}`] = val;
-        }
-        const purchasePath = `organizations/${orgId}/purchases/${purchaseId}`;
-        atomicUpdate[`${purchasePath}/status`] = "completed";
-        atomicUpdate[`${purchasePath}/transactionId`] = transactionId;
-        atomicUpdate[`${purchasePath}/amount`] = amount;
-        atomicUpdate[`${purchasePath}/creditedAt`] = new Date().toISOString();
-        atomicUpdate[`${purchasePath}/creditedUserId`] = callerUid;
-        atomicUpdate[`${purchasePath}/creditedBy`] = "charge-with-saved-card-regular-render";
-        atomicUpdate[`${purchasePath}/correlationId`] = correlationId;
-        atomicUpdate[`${purchasePath}/nedarimWorkingAttempt`] = attempt.label;
-        await admin.database().ref().update(atomicUpdate);
-
-        log.info("User credited successfully via REGULAR (non-Keva) charge", {
-          orgId, callerUid, purchaseId, workingAttempt: attempt.label,
-        });
-
-        return callableOk(res, {
-          success: true, message: "התשלום הצליח (חיוב רגיל, לא הוראת קבע)",
-          workingAttempt: attempt.label, correlationId,
-        });
-      }
-      // status != OK -> log and try next attempt
+      await purchaseRef.update({
+        status: "failed", message: "תגובה לא תקינה מנדרים",
+        callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
+        correlationId,
+      });
+      return callableOk(res, {success: false, error: "תגובה לא תקינה מנדרים", correlationId});
     }
 
-    // כל הניסיונות נכשלו
-    await purchaseRef.update({
-      status: "failed", message: "כל ניסיונות החיוב הרגיל נכשלו",
-      callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
-      correlationId,
+    const status = parsed.Status || parsed.Result;
+    log.info("[REGULAR-CHARGE DebitCard] Parsed response", {
+      orgId, purchaseId, status, message: parsed.Message, fullParsedResponse: parsed,
     });
-    return callableOk(res, {
-      success: false, error: "כל ניסיונות החיוב הרגיל (DebitCard.aspx) נכשלו - בדוק לוגים",
+
+    if (status !== "OK") {
+      await purchaseRef.update({
+        status: "failed", message: parsed.Message || "כשל בחיוב הרגיל (DebitCard.aspx)",
+        callbackReceivedAt: admin.database.ServerValue.TIMESTAMP,
+        correlationId,
+      });
+      return callableOk(res, {
+        success: false, error: parsed.Message || "התשלום נכשל", correlationId,
+      });
+    }
+
+    const transactionId = parsed.TransactionId || parsed.Confirmation || correlationId;
+    const currentTime = user.remainingTime || 0;
+    const currentPrintBudget = user.printBalance || 0;
+    const addingMinutes = purchase.minutes || 0;
+    const addingPrintBudget = purchase.printBudget || 0;
+    const validityDays = purchase.validityDays || 0;
+    const newTime = currentTime + (addingMinutes * 60);
+    const newPrintBudget = currentPrintBudget + addingPrintBudget;
+
+    const updatePayload = {
+      remainingTime: newTime,
+      printBalance: newPrintBudget,
+      updatedAt: new Date().toISOString(),
+      lastCreditedAt: new Date().toISOString(),
+      lastCreditedBy: "charge-with-saved-card-regular-render",
       correlationId,
+    };
+    if (validityDays > 0) {
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + validityDays);
+      updatePayload.timeExpiresAt = expiresAt.toISOString();
+    }
+
+    const atomicUpdate = {};
+    const userPath = `organizations/${orgId}/users/${callerUid}`;
+    for (const [key, val] of Object.entries(updatePayload)) {
+      atomicUpdate[`${userPath}/${key}`] = val;
+    }
+    const purchasePath = `organizations/${orgId}/purchases/${purchaseId}`;
+    atomicUpdate[`${purchasePath}/status`] = "completed";
+    atomicUpdate[`${purchasePath}/transactionId`] = transactionId;
+    atomicUpdate[`${purchasePath}/amount`] = amount;
+    atomicUpdate[`${purchasePath}/creditedAt`] = new Date().toISOString();
+    atomicUpdate[`${purchasePath}/creditedUserId`] = callerUid;
+    atomicUpdate[`${purchasePath}/creditedBy`] = "charge-with-saved-card-regular-render";
+    atomicUpdate[`${purchasePath}/correlationId`] = correlationId;
+    await admin.database().ref().update(atomicUpdate);
+
+    log.info("User credited successfully via REGULAR (DebitCard, non-Keva) charge", {
+      orgId, callerUid, purchaseId, transactionId,
+    });
+
+    return callableOk(res, {
+      success: true, message: "התשלום הצליח (חיוב רגיל, לא הוראת קבע)", correlationId,
     });
   } catch (error) {
     log.error("Error in chargeWithSavedCardRegular", error, {correlationId});
