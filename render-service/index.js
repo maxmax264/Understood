@@ -111,14 +111,33 @@ app.use(express.urlencoded({extended: true}));
 
 // General rate limiting across the whole service - a floor against abuse
 // on every route, on top of any per-route limiter below.
+// /logs/* is exempt: many kiosks behind the same office NAT can share one
+// public IP, and this general limiter (100/15min) is sized for payment
+// traffic, not continuous log shipping - a single busy kiosk alone could
+// exhaust it in minutes and then block the owner dashboard's /logs/computers
+// call too (that's what happened here). /logs/* gets its own, much larger
+// logsLimiter below instead.
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
   message: {error: "יותר מדי בקשות, נסה שוב מאוחר יותר"},
+  skip: (req) => req.path.startsWith("/logs"),
 });
 app.use(generalLimiter);
+
+// Sized for many kiosks (possibly sharing one office IP) shipping log lines
+// continuously, plus the owner dashboard polling for reads - well above
+// realistic volume but still a real ceiling against a runaway/malicious flood.
+const logsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {error: "יותר מדי בקשות ללוגים, נסה שוב מאוחר יותר"},
+});
+app.use("/logs", logsLimiter);
 
 // Stricter limit for the public, unauthenticated signup endpoint.
 const registrationLimiter = rateLimit({
