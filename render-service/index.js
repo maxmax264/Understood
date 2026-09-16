@@ -31,6 +31,7 @@ const express = require("express");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
+const Redis = require("ioredis");
 
 // This server's own public URL, used to build the CallBack= param sent to
 // Nedarim on the saved-card recurring charge (TashlumBodedNew) - per the
@@ -53,6 +54,29 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: process.env.FIREBASE_DATABASE_URL,
 });
+
+// ── Redis init (kiosk log shipping) ──────────────────────────────────
+// Self-bounded on purpose: every kiosk's log list is capped to the last
+// LOG_MAX_LINES entries (oldest dropped on push) AND has a TTL, so it is
+// structurally impossible for this to fill up storage over time the way
+// the old entertainment-channel log dump did - no cleanup job needed.
+const LOG_MAX_LINES = 500;
+const LOG_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const STATUS_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+let redis = null;
+if (process.env.REDIS_URL) {
+  redis = new Redis(process.env.REDIS_URL, {
+    maxRetriesPerRequest: 2,
+    retryStrategy: (times) => Math.min(times * 200, 2000),
+  });
+  redis.on("error", (err) => {
+    // eslint-disable-next-line no-console
+    console.error("Redis error:", err.message);
+  });
+} else {
+  // eslint-disable-next-line no-console
+  console.warn("REDIS_URL not set - /logs endpoints will return 503");
+}
 
 const app = express();
 app.use(express.json());
@@ -1534,6 +1558,164 @@ app.post("/getOrgUserPassword", async (req, res) => {
   } catch (error) {
     log.error("Error getting org user password", error, {correlationId});
     return callableError(res, 500, "internal", "שגיאה בקבלת הסיסמה: " + error.message);
+  }
+});
+
+// ── Kiosk log shipping (Redis-backed, self-cleaning) ─────────────────
+// Ingestion (kiosk -> bridge): simple static API key, same model as the
+// old entertainment-channel shipping used (kiosk is not a browser client
+// and doesn't carry a Firebase ID token for this).
+async function verifyOwner(req) {
+  const authHeader = req.headers.authorization || "";
+  const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!idToken) return null;
+  let decodedToken;
+  try { decodedToken = await admin.auth().verifyIdToken(idToken); }
+  catch (e) { return null; }
+  const ownerSnapshot = await admin.database().ref(`owners/${decodedToken.uid}`).once("value");
+  return ownerSnapshot.exists() ? decodedToken.uid : null;
+}
+
+function requireRedis(res) {
+  if (!redis) {
+    res.status(503).json({success: false, error: "Log storage not configured (REDIS_URL missing)"});
+    return false;
+  }
+  return true;
+}
+
+app.post("/logs/ingest", async (req, res) => {
+  if (!requireRedis(res)) return;
+  if (req.headers["x-api-key"] !== process.env.LOG_INGEST_API_KEY) {
+    return res.status(401).json({success: false, error: "Invalid API key"});
+  }
+  const {computerId, computerName, level, message, timestamp} = req.body || {};
+  if (!computerId || !message) {
+    return res.status(400).json({success: false, error: "Missing computerId/message"});
+  }
+  try {
+    const entry = JSON.stringify({
+      level: level || "Information",
+      message,
+      timestamp: timestamp || new Date().toISOString(),
+    });
+    const pipeline = redis.pipeline();
+    pipeline.lpush(`logs:${computerId}`, entry);
+    pipeline.ltrim(`logs:${computerId}`, 0, LOG_MAX_LINES - 1);
+    pipeline.expire(`logs:${computerId}`, LOG_TTL_SECONDS);
+    pipeline.sadd("logs:computers", computerId);
+    if (computerName) pipeline.hset("logs:names", computerId, computerName);
+    await pipeline.exec();
+    return res.status(200).json({success: true});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/ingest error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+// Structured per-feature install/status reporting (e.g. tightvnc, anydesk,
+// webview2) - separate from the free-text log tail so "did X install ok?"
+// is a single checkbox, not something to hunt for in scrolling log lines.
+app.post("/logs/status", async (req, res) => {
+  if (!requireRedis(res)) return;
+  if (req.headers["x-api-key"] !== process.env.LOG_INGEST_API_KEY) {
+    return res.status(401).json({success: false, error: "Invalid API key"});
+  }
+  const {computerId, computerName, feature, success, message} = req.body || {};
+  if (!computerId || !feature) {
+    return res.status(400).json({success: false, error: "Missing computerId/feature"});
+  }
+  try {
+    const entry = JSON.stringify({success: !!success, message: message || "", timestamp: new Date().toISOString()});
+    const pipeline = redis.pipeline();
+    pipeline.hset(`status:${computerId}`, feature, entry);
+    pipeline.expire(`status:${computerId}`, STATUS_TTL_SECONDS);
+    pipeline.sadd("logs:computers", computerId);
+    if (computerName) pipeline.hset("logs:names", computerId, computerName);
+    await pipeline.exec();
+    return res.status(200).json({success: true});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/status error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+app.get("/logs/computers", async (req, res) => {
+  if (!requireRedis(res)) return;
+  const ownerUid = await verifyOwner(req);
+  if (!ownerUid) return res.status(403).json({success: false, error: "Owner access required"});
+  try {
+    const [ids, names] = await Promise.all([
+      redis.smembers("logs:computers"),
+      redis.hgetall("logs:names"),
+    ]);
+    return res.status(200).json({success: true, computers: ids.map((id) => ({id, name: names[id] || id}))});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/computers error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+app.get("/logs/:computerId", async (req, res) => {
+  if (!requireRedis(res)) return;
+  const ownerUid = await verifyOwner(req);
+  if (!ownerUid) return res.status(403).json({success: false, error: "Owner access required"});
+  try {
+    const {computerId} = req.params;
+    const [rawLines, rawStatus] = await Promise.all([
+      redis.lrange(`logs:${computerId}`, 0, -1),
+      redis.hgetall(`status:${computerId}`),
+    ]);
+    const lines = rawLines.map((l) => { try { return JSON.parse(l); } catch (e) { return {message: l}; } });
+    const status = {};
+    Object.keys(rawStatus || {}).forEach((k) => { try { status[k] = JSON.parse(rawStatus[k]); } catch (e) { status[k] = rawStatus[k]; } });
+    return res.status(200).json({success: true, lines, status});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/:computerId GET error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+app.delete("/logs/:computerId", async (req, res) => {
+  if (!requireRedis(res)) return;
+  const ownerUid = await verifyOwner(req);
+  if (!ownerUid) return res.status(403).json({success: false, error: "Owner access required"});
+  try {
+    const {computerId} = req.params;
+    await Promise.all([
+      redis.del(`logs:${computerId}`),
+      redis.del(`status:${computerId}`),
+      redis.srem("logs:computers", computerId),
+      redis.hdel("logs:names", computerId),
+    ]);
+    return res.status(200).json({success: true});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/:computerId DELETE error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+app.delete("/logs", async (req, res) => {
+  if (!requireRedis(res)) return;
+  const ownerUid = await verifyOwner(req);
+  if (!ownerUid) return res.status(403).json({success: false, error: "Owner access required"});
+  try {
+    const ids = await redis.smembers("logs:computers");
+    const pipeline = redis.pipeline();
+    ids.forEach((id) => { pipeline.del(`logs:${id}`); pipeline.del(`status:${id}`); });
+    pipeline.del("logs:computers");
+    pipeline.del("logs:names");
+    await pipeline.exec();
+    return res.status(200).json({success: true, deleted: ids.length});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs DELETE all error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
   }
 });
 
