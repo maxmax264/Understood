@@ -1548,6 +1548,12 @@ app.post("/resetUserPassword", async (req, res) => {
 
 app.get("/", (req, res) => res.status(200).send("SIONYX payment bridge is up"));
 
+// Lightweight liveness check for the local/Render failover ServerResolver.
+// No auth, no DB/Redis calls - only confirms the process itself is up and
+// responding, so a slow Firebase/Redis dependency never falsely triggers
+// a failover away from an otherwise-healthy server.
+app.get("/health", (req, res) => res.status(200).json({status: "ok"}));
+
 app.post("/getOrgUserPassword", async (req, res) => {
   const correlationId = generateCorrelationId();
   const log = createLogger({correlationId, service: "get-org-user-password"});
