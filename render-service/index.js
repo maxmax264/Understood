@@ -102,7 +102,7 @@ app.use((req, res, next) => {
   if (ALLOWED_ORIGINS.includes(origin)) {
     res.header("Access-Control-Allow-Origin", origin);
   }
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -1680,6 +1680,86 @@ app.get("/logs/computers", async (req, res) => {
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error("logs/computers error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+// ── Owner log-shipping control (master dashboard, pc-sion.web.app/owner) ──
+// The kiosks listen to systemSettings/logShipping/* in Firebase. The owner
+// dashboard goes through these endpoints (Admin SDK, server clock) so the
+// config is always written as ONE whole object and trigger timestamps are
+// authoritative. Nothing is shipped automatically unless autoEnabled is true.
+const LOG_CONFIG_PATH = "systemSettings/logShipping/config";
+const LOG_DEFAULT_CONFIG = {
+  autoEnabled: false,
+  mode: "internal",
+  intervalMs: 0,
+  external: {url: "", apiKey: "", format: "sionyx"},
+};
+
+function normalizeLogConfig(input) {
+  const src = input || {};
+  const ext = src.external || {};
+  return {
+    autoEnabled: src.autoEnabled === true,
+    mode: src.mode === "external" ? "external" : "internal",
+    intervalMs: Math.max(0, Math.floor(Number(src.intervalMs) || 0)),
+    external: {
+      url: typeof ext.url === "string" ? ext.url.trim().replace(/\/+$/, "") : "",
+      apiKey: typeof ext.apiKey === "string" ? ext.apiKey : "",
+      format: ext.format === "channel" ? "channel" : "sionyx",
+    },
+  };
+}
+
+app.get("/logs/config", async (req, res) => {
+  const ownerUid = await verifyOwner(req);
+  if (!ownerUid) return res.status(403).json({success: false, error: "Owner access required"});
+  try {
+    const snap = await admin.database().ref(LOG_CONFIG_PATH).once("value");
+    const config = snap.exists() ? normalizeLogConfig(snap.val()) : LOG_DEFAULT_CONFIG;
+    return res.status(200).json({success: true, config});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/config GET error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+app.put("/logs/config", async (req, res) => {
+  const ownerUid = await verifyOwner(req);
+  if (!ownerUid) return res.status(403).json({success: false, error: "Owner access required"});
+  const config = normalizeLogConfig(req.body && req.body.config);
+  if (config.mode === "external" && !/^https?:\/\/\S+$/i.test(config.external.url)) {
+    return res.status(400).json({success: false, error: "כתובת האתר החיצוני חייבת להתחיל ב-http:// או https://"});
+  }
+  try {
+    await admin.database().ref(LOG_CONFIG_PATH).set(config);
+    return res.status(200).json({success: true, config});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/config PUT error:", error.message);
+    return res.status(500).json({success: false, error: "Internal error"});
+  }
+});
+
+// "Send logs now": computerId given -> that kiosk only, otherwise every kiosk.
+app.post("/logs/trigger", async (req, res) => {
+  const ownerUid = await verifyOwner(req);
+  if (!ownerUid) return res.status(403).json({success: false, error: "Owner access required"});
+  const computerId = req.body && req.body.computerId;
+  if (computerId !== undefined && (typeof computerId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(computerId))) {
+    return res.status(400).json({success: false, error: "Invalid computerId"});
+  }
+  try {
+    const path = computerId ?
+      `systemSettings/logShipping/triggers/${computerId}` :
+      "systemSettings/logShipping/triggerAll";
+    await admin.database().ref(path).set(admin.database.ServerValue.TIMESTAMP);
+    return res.status(200).json({success: true});
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error("logs/trigger error:", error.message);
     return res.status(500).json({success: false, error: "Internal error"});
   }
 });
