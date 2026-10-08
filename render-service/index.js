@@ -1824,6 +1824,9 @@ app.delete("/logs", async (req, res) => {
   }
 });
 
+// Billing (usage-based charges for organizations) - see billing.js
+require("./billing")(app, {admin, verifyOwner});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   // eslint-disable-next-line no-console
